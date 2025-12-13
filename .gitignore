@@ -1,0 +1,20 @@
+# Dataset
+data/
+*.zip
+
+# Outputs
+outputs/
+
+# CSV files
+*.csv
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+.ipynb_checkpoints/
+
+# Credentials
+kaggle.json
+
