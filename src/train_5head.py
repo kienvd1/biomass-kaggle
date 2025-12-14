@@ -47,6 +47,7 @@ from .device import (
     supports_fused_optimizer,
 )
 from .models_5head import (
+    AuxiliaryLoss,
     ConstrainedMSELoss,
     DeadAwareLoss,
     DeadPostProcessor,
@@ -93,25 +94,79 @@ def train_one_epoch(
     scaler: Optional[GradScaler] = None,
     grad_clip: float = 1.0,
     grad_accum_steps: int = 1,
-) -> float:
-    """Train for one epoch with gradient scaling and clipping."""
+    use_aux: bool = False,
+) -> Tuple[float, Dict[str, float]]:
+    """Train for one epoch with gradient scaling and clipping.
+    
+    Returns:
+        avg_loss: Average total loss
+        loss_components: Dict with individual loss components (for auxiliary losses)
+    """
     model.train()
     losses = AverageMeter()
-    
+    loss_components: Dict[str, AverageMeter] = {
+        "biomass": AverageMeter(),
+        "state": AverageMeter(),
+        "month": AverageMeter(),
+        "species": AverageMeter(),
+    }
+
     use_amp, autocast_device, amp_dtype = get_amp_settings(device_type)
-    
+
     pbar = tqdm(loader, desc="Training", leave=False)
     optimizer.zero_grad(set_to_none=True)
-    
-    for step, (x_left, x_right, targets) in enumerate(pbar):
-        x_left = x_left.to(device, non_blocking=True)
-        x_right = x_right.to(device, non_blocking=True)
+
+    for step, batch in enumerate(pbar):
+        # Unpack batch - may or may not have aux labels (now includes species)
+        if use_aux and len(batch) == 6:
+            x_left, x_right, targets, state_labels, month_labels, species_labels = batch
+            state_labels = state_labels.to(device, non_blocking=True)
+            month_labels = month_labels.to(device, non_blocking=True)
+            species_labels = species_labels.to(device, non_blocking=True)
+        else:
+            x_left, x_right, targets = batch[:3]
+            state_labels = None
+            month_labels = None
+            species_labels = None
+
+        # Use channels-last for MPS performance
+        if device_type == DeviceType.MPS:
+            x_left = x_left.to(device, non_blocking=True, memory_format=torch.channels_last)
+            x_right = x_right.to(device, non_blocking=True, memory_format=torch.channels_last)
+        else:
+            x_left = x_left.to(device, non_blocking=True)
+            x_right = x_right.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
-        
+
         with torch.autocast(device_type=autocast_device, dtype=amp_dtype, enabled=use_amp):
-            green, dead, clover, gdm, total = model(x_left, x_right)
+            if use_aux:
+                green, dead, clover, gdm, total, state_logits, month_logits, species_logits = model(
+                    x_left, x_right, return_aux=True
+                )
+            else:
+                green, dead, clover, gdm, total = model(x_left, x_right)
+                state_logits = None
+                month_logits = None
+                species_logits = None
+
             preds = torch.cat([green, dead, clover, gdm, total], dim=1)
-            loss = loss_fn(preds, targets)
+
+            # Compute loss
+            if use_aux and isinstance(loss_fn, AuxiliaryLoss):
+                loss, loss_dict = loss_fn(
+                    preds, targets,
+                    state_logits=state_logits, state_labels=state_labels,
+                    month_logits=month_logits, month_labels=month_labels,
+                    species_logits=species_logits, species_labels=species_labels,
+                )
+                # Track individual components
+                loss_components["biomass"].update(loss_dict.get("loss_biomass", 0), x_left.size(0))
+                loss_components["state"].update(loss_dict.get("loss_state", 0), x_left.size(0))
+                loss_components["month"].update(loss_dict.get("loss_month", 0), x_left.size(0))
+                loss_components["species"].update(loss_dict.get("loss_species", 0), x_left.size(0))
+            else:
+                loss = loss_fn(preds, targets)
+            
             loss = loss / grad_accum_steps
         
         # Backward with optional gradient scaling
@@ -135,7 +190,7 @@ def train_one_epoch(
         losses.update(loss.item() * grad_accum_steps, x_left.size(0))
         pbar.set_postfix({"loss": f"{losses.avg:.4f}"})
     
-    return losses.avg
+    return losses.avg, {k: v.avg for k, v in loss_components.items()}
 
 
 @torch.no_grad()
@@ -146,8 +201,10 @@ def validate(
     device: torch.device,
     device_type: DeviceType,
     postprocessor: Optional[DeadPostProcessor] = None,
+    use_aux: bool = False,
+    apply_context_adjustment: bool = False,
 ) -> Tuple[float, float, Dict[str, float]]:
-    """Validate with optional post-processing."""
+    """Validate with optional post-processing and auxiliary metrics."""
     model.eval()
     losses = AverageMeter()
     
@@ -156,17 +213,79 @@ def validate(
     
     all_preds = []
     all_preds_post = []
+    all_preds_ctx = []  # Predictions with context adjustment
     all_targets = []
     
-    for x_left, x_right, targets in tqdm(loader, desc="Validating", leave=False):
-        x_left = x_left.to(device, non_blocking=True)
-        x_right = x_right.to(device, non_blocking=True)
+    # For auxiliary accuracy
+    state_correct = 0
+    state_total = 0
+    month_correct = 0
+    month_total = 0
+    species_correct = 0
+    species_total = 0
+
+    for batch in tqdm(loader, desc="Validating", leave=False):
+        # Unpack batch (now includes species)
+        if use_aux and len(batch) == 6:
+            x_left, x_right, targets, state_labels, month_labels, species_labels = batch
+            state_labels = state_labels.to(device, non_blocking=True)
+            month_labels = month_labels.to(device, non_blocking=True)
+            species_labels = species_labels.to(device, non_blocking=True)
+        else:
+            x_left, x_right, targets = batch[:3]
+            state_labels = None
+            month_labels = None
+            species_labels = None
+
+        # Use channels-last for MPS performance
+        if device_type == DeviceType.MPS:
+            x_left = x_left.to(device, non_blocking=True, memory_format=torch.channels_last)
+            x_right = x_right.to(device, non_blocking=True, memory_format=torch.channels_last)
+        else:
+            x_left = x_left.to(device, non_blocking=True)
+            x_right = x_right.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
-        
+
         with torch.autocast(device_type=autocast_device, dtype=amp_dtype, enabled=use_amp):
-            green, dead, clover, gdm, total = model(x_left, x_right)
+            if use_aux:
+                # Get predictions with aux logits
+                green, dead, clover, gdm, total, state_logits, month_logits, species_logits = model(
+                    x_left, x_right, return_aux=True
+                )
+
+                # Compute auxiliary accuracy
+                if state_labels is not None:
+                    state_pred = state_logits.argmax(dim=1)
+                    state_correct += (state_pred == state_labels).sum().item()
+                    state_total += state_labels.size(0)
+
+                if month_labels is not None:
+                    month_pred = month_logits.argmax(dim=1)
+                    month_correct += (month_pred == month_labels).sum().item()
+                    month_total += month_labels.size(0)
+
+                if species_labels is not None:
+                    species_pred = species_logits.argmax(dim=1)
+                    species_correct += (species_pred == species_labels).sum().item()
+                    species_total += species_labels.size(0)
+
+                # Also get context-adjusted predictions for comparison
+                if apply_context_adjustment:
+                    green_ctx, dead_ctx, clover_ctx, gdm_ctx, total_ctx = model(
+                        x_left, x_right, return_aux=False, apply_context_adjustment=True
+                    )
+                    preds_ctx = torch.cat([green_ctx, dead_ctx, clover_ctx, gdm_ctx, total_ctx], dim=1)
+                    all_preds_ctx.append(preds_ctx.float().cpu())
+            else:
+                green, dead, clover, gdm, total = model(x_left, x_right)
+            
             preds = torch.cat([green, dead, clover, gdm, total], dim=1)
-            loss = loss_fn(preds, targets)
+            
+            # Compute loss (base loss only for validation metric)
+            if isinstance(loss_fn, AuxiliaryLoss):
+                loss = loss_fn.base_loss(preds, targets)
+            else:
+                loss = loss_fn(preds, targets)
         
         losses.update(loss.item(), x_left.size(0))
         
@@ -197,6 +316,13 @@ def validate(
         r2_post = r2_raw
         all_preds_post = all_preds
     
+    # Compute metrics for context-adjusted predictions
+    if all_preds_ctx:
+        all_preds_ctx = torch.cat(all_preds_ctx, dim=0).numpy()
+        r2_ctx = compute_weighted_r2(all_preds_ctx, all_targets, target_weights)
+    else:
+        r2_ctx = r2_raw
+    
     # Per-target metrics (for post-processed)
     target_names = ["green", "dead", "clover", "gdm", "total"]
     per_target = compute_per_target_metrics_np(all_preds_post, all_targets, target_names, target_weights)
@@ -209,18 +335,27 @@ def validate(
     
     metrics["r2_raw"] = r2_raw
     metrics["r2_post"] = r2_post
+    metrics["r2_ctx"] = r2_ctx  # Context-adjusted R²
     metrics["weighted_r2"] = r2_post  # Use post-processed for best metric
     
+    # Add auxiliary accuracy metrics
+    if state_total > 0:
+        metrics["state_acc"] = state_correct / state_total
+    if month_total > 0:
+        metrics["month_acc"] = month_correct / month_total
+    if species_total > 0:
+        metrics["species_acc"] = species_correct / species_total
+
     return losses.avg, r2_post, metrics
 
 
-def freeze_backbone(model: nn.Module) -> None:
+def freeze_backbone_fn(model: nn.Module) -> None:
     """Freeze backbone parameters."""
     for param in model.backbone.parameters():
         param.requires_grad = False
 
 
-def unfreeze_backbone(model: nn.Module) -> None:
+def unfreeze_backbone_fn(model: nn.Module) -> None:
     """Unfreeze backbone parameters."""
     for param in model.backbone.parameters():
         param.requires_grad = True
@@ -293,15 +428,25 @@ def train_fold(
     device: torch.device,
     device_type: DeviceType,
 ) -> Dict:
-    """Train a single fold with optional 2-stage training."""
+    """Train a single fold with optional 2-stage training and auxiliary heads."""
     two_stage = getattr(cfg, "two_stage", False)
     freeze_epochs = getattr(cfg, "freeze_epochs", 5)
+    use_aux_heads = getattr(cfg, "use_aux_heads", False)
+    freeze_backbone = getattr(cfg, "freeze_backbone", False)
+    
+    # If freeze_backbone is set, it overrides two_stage
+    if freeze_backbone:
+        two_stage = False  # Disable 2-stage, just freeze throughout
     
     print(f"\n{'='*60}")
     print(f"Training Fold {fold}")
     print(f"Train: {len(train_df)}, Valid: {len(valid_df)}")
-    if two_stage:
+    if freeze_backbone:
+        print(f"HEAD-ONLY MODE: Backbone frozen, training heads only")
+    elif two_stage:
         print(f"2-Stage: Stage 1 ({freeze_epochs} epochs frozen), Stage 2 (finetune)")
+    if use_aux_heads:
+        print(f"Auxiliary Heads: State + Month classification enabled")
     print(f"{'='*60}")
     
     # Datasets
@@ -314,8 +459,14 @@ def train_fold(
     if cfg.cache_images and cfg.num_workers > 0:
         print(f"WARNING: cache_images=True, forcing num_workers=0 (was {cfg.num_workers})")
     
-    train_ds = BiomassDataset(train_df, cfg.train_image_dir, train_transform, is_train=True, cache_images=cfg.cache_images)
-    valid_ds = BiomassDataset(valid_df, cfg.train_image_dir, valid_transform, is_train=False, cache_images=cfg.cache_images)
+    train_ds = BiomassDataset(
+        train_df, cfg.train_image_dir, train_transform, 
+        is_train=True, cache_images=cfg.cache_images, return_aux_labels=use_aux_heads
+    )
+    valid_ds = BiomassDataset(
+        valid_df, cfg.train_image_dir, valid_transform, 
+        is_train=False, cache_images=cfg.cache_images, return_aux_labels=use_aux_heads
+    )
     
     pin_memory = device_type == DeviceType.CUDA
     
@@ -324,12 +475,14 @@ def train_fold(
         num_workers=num_workers, pin_memory=pin_memory, drop_last=True,
         persistent_workers=num_workers > 0, prefetch_factor=cfg.prefetch_factor if num_workers > 0 else None,
     )
+    # Validation can use larger batch size (no gradients needed)
+    valid_batch_multiplier = 4 if device_type == DeviceType.MPS else 2
     valid_loader = DataLoader(
-        valid_ds, batch_size=cfg.batch_size * 2, shuffle=False,
+        valid_ds, batch_size=cfg.batch_size * valid_batch_multiplier, shuffle=False,
         num_workers=num_workers, pin_memory=pin_memory,
         persistent_workers=num_workers > 0, prefetch_factor=cfg.prefetch_factor if num_workers > 0 else None,
     )
-    
+
     # Model
     model = build_5head_model(
         backbone_name=cfg.backbone,
@@ -340,18 +493,35 @@ def train_fold(
         use_film=getattr(cfg, "use_film", True),
         use_attention_pool=getattr(cfg, "use_attention_pool", True),
         gradient_checkpointing=getattr(cfg, "grad_ckpt", False),
+        use_aux_heads=use_aux_heads,
     ).to(device)
-    
+
+    # Use channels-last memory format for better performance on MPS
+    if device_type == DeviceType.MPS:
+        model = model.to(memory_format=torch.channels_last)
+
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model: 5-Head DINOv2 ({cfg.backbone})")
     print(f"Grid: {cfg.grid}, FiLM: {getattr(cfg, 'use_film', True)}, AttnPool: {getattr(cfg, 'use_attention_pool', True)}")
+    if use_aux_heads:
+        print(f"Auxiliary heads: State (4 classes), Month (10 classes)")
     print(f"Total params: {total_params:,}")
     
-    # Setup for 2-stage or single-stage training
+    # Setup for 2-stage, freeze-backbone, or single-stage training
     current_stage = 1 if two_stage else 2
     
-    if two_stage:
-        freeze_backbone(model)
+    if freeze_backbone:
+        # HEAD-ONLY MODE: Freeze backbone for entire training
+        freeze_backbone_fn(model)
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"HEAD-ONLY: Backbone FROZEN ({trainable_params:,} / {total_params:,} params trainable)")
+        # Use higher LR for heads since backbone is frozen
+        head_lr = getattr(cfg, "head_lr_stage1", 1e-3)
+        optimizer = get_optimizer(model, head_lr, cfg.backbone_lr, cfg.weight_decay, device_type, stage=1)
+        scheduler = get_scheduler_with_warmup(optimizer, cfg.epochs, warmup_epochs=cfg.warmup_epochs)
+        current_stage = 1  # Stay in stage 1 (frozen) forever
+    elif two_stage:
+        freeze_backbone_fn(model)
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"Stage 1: Backbone FROZEN ({trainable_params:,} / {total_params:,} params trainable)")
         optimizer = get_optimizer(model, cfg.head_lr_stage1, cfg.backbone_lr, cfg.weight_decay, device_type, stage=1)
@@ -370,20 +540,32 @@ def train_fold(
     
     if getattr(cfg, "use_dead_aware_loss", False):
         # Special loss for improving Dead prediction
-        loss_fn = DeadAwareLoss(
+        base_loss_fn = DeadAwareLoss(
             target_weights=target_weights,
             use_log_for_dead=True,
             aux_dead_weight=0.2,
         )
         print("Using DeadAwareLoss (log-space + auxiliary Dead loss)")
     elif getattr(cfg, "use_focal_loss", False):
-        loss_fn = FocalMSELoss(target_weights=target_weights, gamma=1.0)
+        base_loss_fn = FocalMSELoss(target_weights=target_weights, gamma=1.0)
     else:
-        loss_fn = ConstrainedMSELoss(
+        base_loss_fn = ConstrainedMSELoss(
             target_weights=target_weights,
             constraint_weight=cfg.constraint_weight,
             use_huber_for_dead=getattr(cfg, "use_huber_for_dead", True),
         )
+    
+    # Wrap with auxiliary loss if using aux heads
+    if use_aux_heads:
+        loss_fn = AuxiliaryLoss(
+            base_loss=base_loss_fn,
+            state_weight=getattr(cfg, "aux_state_weight", 5.0),
+            month_weight=getattr(cfg, "aux_month_weight", 3.0),
+            species_weight=getattr(cfg, "aux_species_weight", 2.0),
+        )
+        print(f"Using AuxiliaryLoss: state={cfg.aux_state_weight}, month={cfg.aux_month_weight}, species={getattr(cfg, 'aux_species_weight', 2.0)}")
+    else:
+        loss_fn = base_loss_fn
     
     # Post-processor for validation
     postprocessor = DeadPostProcessor(
@@ -412,23 +594,27 @@ def train_fold(
             print(f"  Head LR: {cfg.lr:.2e}, Backbone LR: {cfg.backbone_lr:.2e}")
             print(f"{'='*60}")
             
-            unfreeze_backbone(model)
+            unfreeze_backbone_fn(model)
             optimizer = get_optimizer(model, cfg.lr, cfg.backbone_lr, cfg.weight_decay, device_type, stage=2)
             remaining_epochs = cfg.epochs - freeze_epochs
             scheduler = get_scheduler_with_warmup(optimizer, remaining_epochs, warmup_epochs=cfg.warmup_epochs)
             patience_counter = 0  # Reset patience for stage 2
         
         # Train
-        train_loss = train_one_epoch(
+        train_loss, train_loss_components = train_one_epoch(
             model, train_loader, optimizer, loss_fn, device, device_type,
             scaler=scaler,
             grad_clip=cfg.grad_clip,
             grad_accum_steps=getattr(cfg, "grad_accum", 1),
+            use_aux=use_aux_heads,
         )
         
         # Validate
+        apply_ctx = getattr(cfg, "apply_context_adjustment", False)
         valid_loss, r2, metrics = validate(
-            model, valid_loader, loss_fn, device, device_type, postprocessor
+            model, valid_loader, loss_fn, device, device_type, postprocessor,
+            use_aux=use_aux_heads,
+            apply_context_adjustment=apply_ctx and use_aux_heads,
         )
         
         scheduler.step()
@@ -440,16 +626,29 @@ def train_fold(
         
         r2_vec = [metrics.get(f"r2_{n}", 0.0) for n in ["green", "dead", "clover", "gdm", "total"]]
         
+        r2_ctx = metrics.get('r2_ctx', metrics['r2_raw'])
         print(
             f"Epoch {epoch:02d} {stage_str:>3} | "
             f"Train: {train_loss:.4f} | "
             f"Valid: {valid_loss:.4f} | "
             f"R² raw: {metrics['r2_raw']:.4f} | "
             f"R² post: {metrics['r2_post']:.4f} | "
+            f"R² ctx: {r2_ctx:.4f} | "
             f"LR: {lr:.2e} | "
             f"Time: {elapsed:.1f}s"
         )
         print(f"   per-target R²[g,d,c,gdm,t]=[{', '.join(f'{x:.3f}' for x in r2_vec)}]")
+        
+        # Log auxiliary metrics if available
+        if use_aux_heads:
+            state_acc = metrics.get("state_acc", 0)
+            month_acc = metrics.get("month_acc", 0)
+            species_acc = metrics.get("species_acc", 0)
+            print(f"   aux acc: State={state_acc:.3f}, Month={month_acc:.3f}, Species={species_acc:.3f}")
+            print(f"   aux loss: biomass={train_loss_components.get('biomass', 0):.3f}, "
+                  f"state={train_loss_components.get('state', 0):.3f}, "
+                  f"month={train_loss_components.get('month', 0):.3f}, "
+                  f"species={train_loss_components.get('species', 0):.3f}")
         
         history["train_loss"].append(train_loss)
         history["valid_loss"].append(valid_loss)
@@ -462,8 +661,9 @@ def train_fold(
         # Save best model
         # - Always save if not using two-stage
         # - In two-stage: save in stage 2, OR save in stage 1 if freeze_epochs >= epochs (head-only mode)
+        # - In freeze_backbone mode: always save (it's head-only training)
         head_only_mode = two_stage and freeze_epochs >= cfg.epochs
-        save_ok = (current_stage == 2) or (not two_stage) or head_only_mode
+        save_ok = (current_stage == 2) or (not two_stage) or head_only_mode or freeze_backbone
         
         # Handle NaN - don't save if metrics are NaN
         if save_ok and not np.isnan(r2) and r2 > best_r2:
@@ -543,6 +743,20 @@ def main() -> None:
     parser.add_argument("--two-stage", action="store_true", help="Enable 2-stage training")
     parser.add_argument("--freeze-epochs", type=int, default=5, help="Stage 1 epochs with frozen backbone")
     parser.add_argument("--head-lr-stage1", type=float, default=1e-3, help="Head LR for stage 1")
+    parser.add_argument("--freeze-backbone", action="store_true", 
+                        help="Keep backbone frozen throughout training (head-only mode)")
+    
+    # Auxiliary heads for multi-task learning
+    parser.add_argument("--use-aux-heads", action="store_true",
+                        help="Add auxiliary heads for State, Month, and Species classification")
+    parser.add_argument("--aux-state-weight", type=float, default=5.0,
+                        help="Weight for state classification loss")
+    parser.add_argument("--aux-month-weight", type=float, default=3.0,
+                        help="Weight for month classification loss")
+    parser.add_argument("--aux-species-weight", type=float, default=2.0,
+                        help="Weight for species classification loss")
+    parser.add_argument("--apply-context-adjustment", action="store_true",
+                        help="Use predicted state/month/species to adjust predictions at inference")
     
     # Loss function
     parser.add_argument("--constraint-weight", type=float, default=0.05,
@@ -607,7 +821,9 @@ def main() -> None:
     print(f"FiLM: {args.use_film}, AttnPool: {args.use_attention_pool}")
     print(f"Hidden ratio: {args.hidden_ratio}, Dropout: {args.dropout}")
     print(f"Epochs: {args.epochs}, Batch size: {args.batch_size}")
-    if args.two_stage:
+    if args.freeze_backbone:
+        print(f"HEAD-ONLY Training: Backbone frozen, head LR: {args.head_lr_stage1:.2e}")
+    elif args.two_stage:
         print(f"2-Stage Training:")
         print(f"  Stage 1: {args.freeze_epochs} epochs, head LR: {args.head_lr_stage1:.2e}")
         print(f"  Stage 2: remaining epochs, head LR: {args.lr:.2e}, backbone LR: {args.backbone_lr:.2e}")
@@ -617,6 +833,10 @@ def main() -> None:
     print(f"Constraint weight: {args.constraint_weight}")
     print(f"Dead-aware loss: {args.use_dead_aware_loss}")
     print(f"Huber for dead: {args.use_huber_for_dead}")
+    if args.use_aux_heads:
+        print(f"Auxiliary heads: State (weight={args.aux_state_weight}), Month (weight={args.aux_month_weight})")
+        if args.apply_context_adjustment:
+            print(f"Context adjustment: ENABLED (predictions adjusted based on predicted state/month)")
     print(f"Output: {args.output_dir}")
     print("=" * 60)
     

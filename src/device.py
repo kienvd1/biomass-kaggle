@@ -195,8 +195,9 @@ def model_to_device(
     """
     model = model.to(device)
     
-    if compile_model and device_type in (DeviceType.CUDA, DeviceType.MPS):
-        # torch.compile works on CUDA and MPS (PyTorch 2.0+)
+    if compile_model and device_type == DeviceType.CUDA:
+        # torch.compile only fully supports CUDA (TorchInductor uses Triton)
+        # MPS is NOT supported by TorchInductor backend
         model = torch.compile(model, mode=compile_mode, dynamic=False, fullgraph=False)
     
     return model

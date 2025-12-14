@@ -407,6 +407,95 @@ loss = main_loss + 0.1 * ndvi_loss + 0.1 * height_loss
 
 ---
 
+## 10. 5-Head model + auxiliary heads (no metadata at inference)
+
+This repo also includes a dedicated 5-output model (`src/train_5head.py`, `src/models_5head.py`) with **auxiliary classification heads** (State/Month/Species).
+
+**Important:** this setup is compatible with **no metadata at inference**, because:
+- The model input is still only `(left_image, right_image)`.
+- Metadata is used only as **training labels** for auxiliary losses (`--use-aux-heads`).
+- At inference, auxiliary heads are optional. If you enable context adjustment (`--apply-context-adjustment`), it uses **predicted** aux logits (still no metadata required).
+
+### 10.1 Recommended, inference-safe improvements (highest ROI)
+
+#### A) Stereo augmentation: same geometry, independent photometric
+Current `BiomassDataset` uses `A.ReplayCompose` so the **same** transform is replayed on both views. That’s correct for **geometry**, but it also unintentionally ties **photometric** noise/jitter between left/right.
+
+Recommendation:
+- Apply **the same** spatial transform (crop/resize/flip/affine) to both views.
+- Apply **independent** color/noise/blur transforms to each view.
+
+Why:
+- Improves robustness to real stereo differences (exposure, blur, sensor noise).
+- Reduces “shortcut learning” where the model expects perfectly matched photometrics.
+
+#### B) Replace hard-coded context adjustment with a learned adjustment head
+`FiveHeadDINO._apply_context_adjustment()` currently uses fixed multipliers (hand-crafted priors for WA/month/species). This can help, but can also hurt under distribution shift or misclassified aux labels.
+
+Recommendation:
+- Use predicted aux probabilities and learn a small MLP that outputs **soft adjustment factors** (or residuals) for Dead/Clover (and optionally others).
+- Keep it differentiable and trained end-to-end.
+
+This keeps inference metadata-free while letting the model learn calibration instead of relying on constants.
+
+#### C) Species imbalance: simplify or stabilize
+Species groups are highly imbalanced (e.g. `Mixed` is extremely rare) and current class weights are very large for rare groups.
+
+Recommendations (pick 1):
+- Reduce to fewer species groups (e.g. 4 buckets) to avoid ultra-rare classes, or
+- Keep 8 groups but lower `--aux-species-weight` and add label smoothing to the species CE, or
+- Compute species weights **per fold** from `train_df` instead of hard-coded global weights.
+
+### 10.2 Suggested hyperparameter search space (for `src/train_5head.py`)
+
+Start with single-fold sweeps (e.g. `--train-folds 0`) to iterate quickly, then confirm with full CV.
+
+- **grid**: `(2,2)`, `(3,3)` (optionally `(2,3)` as a middle point)
+- **dropout**: `0.1 – 0.35`
+- **hidden_ratio**: `0.25 – 1.0`
+- **loss**:
+  - `ConstrainedMSELoss` with `--constraint-weight 0` (disable constraints), OR
+  - `--use-dead-aware-loss` (often improves Dead stability)
+- **frozen backbone (head-only)**
+  - `--freeze-backbone`
+  - `--head-lr-stage1`: `5e-4 – 3e-3` (log-scale)
+- **two-stage finetune (optional)**
+  - `--two-stage`
+  - `--freeze-epochs`: `2 – 10`
+  - `--head-lr-stage1`: `5e-4 – 3e-3`
+  - `--lr`: `5e-5 – 3e-4`
+  - `--backbone-lr`: `5e-6 – 5e-5`
+- **aux head weights**
+  - `--aux-month-weight`: `3 – 8`
+  - `--aux-state-weight`: `1 – 5`
+  - `--aux-species-weight`: `0.5 – 3` (keep lower if species is noisy/rare)
+- **aug_prob**: `0.3 – 0.7`
+- **grad_clip**: `0.5 – 2.0`
+
+Example “fast sweep” command:
+
+```bash
+python -m src.train_5head \
+  --train-folds 0 \
+  --epochs 25 \
+  --freeze-backbone \
+  --grid 2 2 \
+  --constraint-weight 0 \
+  --use-aux-heads \
+  --aux-month-weight 5.0 \
+  --aux-state-weight 3.0 \
+  --aux-species-weight 2.0
+```
+
+### 10.3 A/B tests worth running (in order)
+- **2x2 vs 3x3 grid** (keep everything else fixed)
+- **constraint on vs off** (`--constraint-weight 0` vs default)
+- **aux heads on vs off** (`--use-aux-heads`)
+- **DeadAwareLoss vs baseline** (`--use-dead-aware-loss`)
+- **context adjustment off vs on** (`--apply-context-adjustment`) — only if you use a learned adjustment; hard-coded priors can overfit
+
+---
+
 ## 8. Priority Ranking
 
 | Improvement | Expected Gain | Effort | Priority |

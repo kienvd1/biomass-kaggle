@@ -218,13 +218,14 @@ class TwoStreamDINOTiledFiLM(TwoStreamDINOBase):
         self.film_right = FiLM(self.feat_dim)
     
     def _tiles_backbone(self, x: torch.Tensor) -> torch.Tensor:
-        """Extract features from image tiles."""
+        """Extract features from image tiles - batched for speed."""
         B, C, H, W = x.shape
         r, c = self.grid
         rows = _make_edges(H, r)
         cols = _make_edges(W, c)
-        
-        feats = []
+
+        # Collect all tiles
+        tiles = []
         for rs, re in rows:
             for cs, ce in cols:
                 xt = x[:, :, rs:re, cs:ce]
@@ -235,10 +236,13 @@ class TwoStreamDINOTiledFiLM(TwoStreamDINOBase):
                         mode="bilinear",
                         align_corners=False,
                     )
-                ft = self.backbone(xt)
-                feats.append(ft)
-        
-        feats = torch.stack(feats, dim=0).permute(1, 0, 2)  # (B, num_tiles, D)
+                tiles.append(xt)
+
+        # Stack and process all tiles in one forward pass
+        num_tiles = len(tiles)
+        tiles = torch.cat(tiles, dim=0)  # (B * num_tiles, C, H, W)
+        feats = self.backbone(tiles)     # (B * num_tiles, D)
+        feats = feats.view(num_tiles, B, -1).permute(1, 0, 2)  # (B, num_tiles, D)
         return feats
     
     def _encode_stream(self, x: torch.Tensor, film: FiLM) -> torch.Tensor:

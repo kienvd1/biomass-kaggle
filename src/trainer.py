@@ -369,8 +369,13 @@ class Trainer:
         optimizer.zero_grad(set_to_none=True)  # More efficient
         
         for step, (x_left, x_right, targets) in enumerate(pbar):
-            x_left = x_left.to(self.device, non_blocking=True)
-            x_right = x_right.to(self.device, non_blocking=True)
+            # Use channels-last for MPS performance
+            if self.device_type == DeviceType.MPS:
+                x_left = x_left.to(self.device, non_blocking=True, memory_format=torch.channels_last)
+                x_right = x_right.to(self.device, non_blocking=True, memory_format=torch.channels_last)
+            else:
+                x_left = x_left.to(self.device, non_blocking=True)
+                x_right = x_right.to(self.device, non_blocking=True)
             targets = targets.to(self.device, non_blocking=True)
             
             # Forward pass with AMP
@@ -429,10 +434,15 @@ class Trainer:
         )
         
         for x_left, x_right, targets in pbar:
-            x_left = x_left.to(self.device, non_blocking=True)
-            x_right = x_right.to(self.device, non_blocking=True)
+            # Use channels-last for MPS performance
+            if self.device_type == DeviceType.MPS:
+                x_left = x_left.to(self.device, non_blocking=True, memory_format=torch.channels_last)
+                x_right = x_right.to(self.device, non_blocking=True, memory_format=torch.channels_last)
+            else:
+                x_left = x_left.to(self.device, non_blocking=True)
+                x_right = x_right.to(self.device, non_blocking=True)
             targets = targets.to(self.device, non_blocking=True)
-            
+
             with torch.autocast(
                 device_type=self.autocast_device_type, dtype=self.amp_dtype, enabled=self.use_amp
             ):
@@ -527,9 +537,11 @@ class Trainer:
             drop_last=True,
             **loader_kwargs,
         )
+        # Validation can use larger batch size (no gradients needed)
+        valid_batch_multiplier = 4 if self.device_type == DeviceType.MPS else 2
         valid_loader = DataLoader(
             valid_ds,
-            batch_size=self.cfg.batch_size * 2,
+            batch_size=self.cfg.batch_size * valid_batch_multiplier,
             shuffle=False,
             **loader_kwargs,
         )
@@ -545,7 +557,11 @@ class Trainer:
             gradient_checkpointing=self.cfg.gradient_checkpointing,
         )
         model = model.to(self.device)
-        
+
+        # Use channels-last memory format for better performance on MPS
+        if self.device_type == DeviceType.MPS:
+            model = model.to(memory_format=torch.channels_last)
+
         # Compile model for faster training (PyTorch 2.0+)
         if self.cfg.compile_model:
             compile_mode = getattr(self.cfg, "compile_mode", "max-autotune")

@@ -11,9 +11,44 @@ from torch.utils.data import Dataset
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
+# Fast JPEG loading with TurboJPEG (optional)
+try:
+    from turbojpeg import TurboJPEG
+    _jpeg = TurboJPEG()
+    _USE_TURBOJPEG = True
+except ImportError:
+    _USE_TURBOJPEG = False
+
 
 class BiomassDataset(Dataset):
     """Dataset for biomass prediction from stereo image pairs."""
+
+    # Label mappings for auxiliary heads (must match models_5head.py)
+    STATE_LABELS: Dict[str, int] = {"NSW": 0, "Tas": 1, "Vic": 2, "WA": 3}
+    MONTH_LABELS: Dict[int, int] = {1: 0, 2: 1, 4: 2, 5: 3, 6: 4, 7: 5, 8: 6, 9: 7, 10: 8, 11: 9}
+
+    # Species labels - grouped by similarity for better learning
+    SPECIES_LABELS: Dict[str, int] = {
+        # Clover-dominant (usually high clover, low/zero dead in WA)
+        "Clover": 0,
+        "WhiteClover": 0,
+        "SubcloverLosa": 0,
+        "SubcloverDalkeith": 0,
+        # Ryegrass types
+        "Ryegrass": 1,
+        "Ryegrass_Clover": 2,
+        # Phalaris types
+        "Phalaris": 3,
+        "Phalaris_Clover": 4,
+        "Phalaris_Ryegrass_Clover": 4,
+        "Phalaris_Clover_Ryegrass_Barleygrass_Bromegrass": 4,
+        "Phalaris_BarleyGrass_SilverGrass_SpearGrass_Clover_Capeweed": 4,
+        # Other grasses (often zero clover)
+        "Fescue": 5,
+        "Fescue_CrumbWeed": 5,
+        "Lucerne": 6,
+        "Mixed": 7,
+    }
     
     def __init__(
         self,
@@ -22,6 +57,7 @@ class BiomassDataset(Dataset):
         transform: Optional[A.Compose] = None,
         is_train: bool = True,
         cache_images: bool = False,
+        return_aux_labels: bool = False,
     ) -> None:
         """
         Args:
@@ -30,18 +66,40 @@ class BiomassDataset(Dataset):
             transform: Albumentations transform
             is_train: Whether this is training data
             cache_images: If True, cache all images in RAM (use when you have >16GB free RAM)
+            return_aux_labels: If True, return State and Month labels for auxiliary heads
         """
         self.df = df.reset_index(drop=True)
         self.image_dir = image_dir
         self.transform = transform
         self.is_train = is_train
         self.cache_images = cache_images
+        self.return_aux_labels = return_aux_labels
         self._cache: Dict[int, np.ndarray] = {}
         
         self.paths = self.df["image_path"].values
         self.targets = self.df[
             ["Dry_Green_g", "Dry_Dead_g", "Dry_Clover_g", "GDM_g", "Dry_Total_g"]
         ].values.astype(np.float32)
+        
+        # Prepare auxiliary labels if needed
+        if self.return_aux_labels:
+            # State labels
+            if "State" in self.df.columns:
+                self.state_labels = self.df["State"].map(self.STATE_LABELS).values.astype(np.int64)
+            else:
+                self.state_labels = np.zeros(len(self.df), dtype=np.int64)
+
+            # Month labels (from Sampling_Date_Month column)
+            if "Sampling_Date_Month" in self.df.columns:
+                self.month_labels = self.df["Sampling_Date_Month"].astype(int).map(self.MONTH_LABELS).values.astype(np.int64)
+            else:
+                self.month_labels = np.zeros(len(self.df), dtype=np.int64)
+
+            # Species labels
+            if "Species" in self.df.columns:
+                self.species_labels = self.df["Species"].map(self.SPECIES_LABELS).fillna(7).values.astype(np.int64)
+            else:
+                self.species_labels = np.zeros(len(self.df), dtype=np.int64)
         
         # Pre-cache all images if enabled
         if self.cache_images:
@@ -54,37 +112,54 @@ class BiomassDataset(Dataset):
         return len(self.df)
     
     def _load_image(self, idx: int) -> np.ndarray:
-        """Load image from disk or cache."""
+        """Load image from disk or cache. Uses TurboJPEG if available for speed."""
         if idx in self._cache:
             return self._cache[idx]
-        
+
         filename = os.path.basename(self.paths[idx])
         full_path = os.path.join(self.image_dir, filename)
-        
-        img = cv2.imread(full_path)
+
+        img = None
+
+        # Try TurboJPEG first (faster for JPEG files)
+        if _USE_TURBOJPEG and full_path.lower().endswith(('.jpg', '.jpeg')):
+            try:
+                with open(full_path, 'rb') as f:
+                    img = _jpeg.decode(f.read())  # Returns RGB directly
+            except Exception:
+                img = None
+
+        # Fallback to OpenCV
+        if img is None:
+            img = cv2.imread(full_path)
+            if img is not None:
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+        # Create blank image if loading failed
         if img is None:
             img = np.zeros((1000, 2000, 3), dtype=np.uint8)
-        else:
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        
+
         if self.cache_images:
             self._cache[idx] = img
         return img
     
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, ...]:
         """
         Returns:
             left_tensor: Left image tensor (C, H, W)
             right_tensor: Right image tensor (C, H, W)
             targets: Target values tensor (5,)
+            state_label: (optional) State label (int) if return_aux_labels=True
+            month_label: (optional) Month label (int) if return_aux_labels=True
+            species_label: (optional) Species label (int) if return_aux_labels=True
         """
         img = self._load_image(idx)
-        
+
         h, w, _ = img.shape
         mid = w // 2
         left = img[:, :mid]
         right = img[:, mid:]
-        
+
         if self.transform:
             # Apply same spatial transform to both views
             if self.is_train:
@@ -97,9 +172,15 @@ class BiomassDataset(Dataset):
         else:
             left_t = torch.from_numpy(left.transpose(2, 0, 1)).float() / 255.0
             right_t = torch.from_numpy(right.transpose(2, 0, 1)).float() / 255.0
-        
+
         targets = torch.tensor(self.targets[idx], dtype=torch.float32)
-        
+
+        if self.return_aux_labels:
+            state_label = torch.tensor(self.state_labels[idx], dtype=torch.long)
+            month_label = torch.tensor(self.month_labels[idx], dtype=torch.long)
+            species_label = torch.tensor(self.species_labels[idx], dtype=torch.long)
+            return left_t, right_t, targets, state_label, month_label, species_label
+
         return left_t, right_t, targets
 
 
