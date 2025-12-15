@@ -182,6 +182,13 @@ Constrained mixing augmentation - only mixes samples with same species, month, A
 | `--num-folds` | int | `5` | Number of CV folds |
 | `--train-folds` | int+ | `0 1 2 3 4` | Which folds to train. Use `--train-folds 0` for quick testing |
 | `--cv-strategy` | str | `group_month` | CV split strategy. Options: `group_month`, `group_date`, `group_date_state`, `group_date_state_bin`, `stratified`, `random` |
+| `--fold-csv` | str | None | Path to CSV with pre-defined folds. Must have `sample_id_prefix` and `fold` columns. Overrides `--cv-strategy` |
+
+**Using Pre-defined Folds:**
+```bash
+# Use folds from external CSV (e.g., trainfold.csv)
+python -m src.train_5head --fold-csv data/trainfold.csv --train-folds 0 1 2 3 4
+```
 
 **CV Strategies:**
 - `group_month`: Group by month, stratify by target bins (recommended)
@@ -289,6 +296,24 @@ python -m src.train_5head \
     --mixup-prob 0.2 \
     --cutmix-prob 0.2 \
     --device-type cuda
+```
+
+### With Pre-defined Folds
+
+```bash
+# Use external fold assignments (e.g., from trainfold.csv)
+python -m src.train_5head \
+    --fold-csv data/trainfold.csv \
+    --epochs 50 \
+    --freeze-backbone \
+    --use-log-target \
+    --device-type cuda
+
+# Train only specific folds
+python -m src.train_5head \
+    --fold-csv data/trainfold.csv \
+    --train-folds 0 2 4 \
+    --epochs 30
 ```
 
 ### OOF Evaluation

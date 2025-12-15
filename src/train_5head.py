@@ -45,6 +45,13 @@ from .dataset import (
     get_valid_transforms,
     prepare_dataframe,
 )
+from .eval_5head_oof import (
+    compute_metrics,
+    load_model as load_oof_model,
+    predict_fold as predict_oof_fold,
+    OOFDataset,
+    get_val_transform,
+)
 from .device import (
     DeviceType,
     empty_cache,
@@ -225,7 +232,7 @@ def validate(
     losses = AverageMeter()
     
     use_amp, autocast_device, amp_dtype = get_amp_settings(device_type)
-    target_weights = [0.1, 0.1, 0.1, 0.2, 0.5]
+    target_weights = [0.1, 0.1, 0.1, 0.2, 0.5]  # Competition weights
     
     all_preds = []
     all_preds_post = []
@@ -376,13 +383,17 @@ def validate(
 
 def freeze_backbone_fn(model: nn.Module) -> None:
     """Freeze backbone parameters."""
-    for param in model.backbone.parameters():
+    # Handle DataParallel wrapped models
+    base_model = model.module if hasattr(model, "module") else model
+    for param in base_model.backbone.parameters():
         param.requires_grad = False
 
 
 def unfreeze_backbone_fn(model: nn.Module) -> None:
     """Unfreeze backbone parameters."""
-    for param in model.backbone.parameters():
+    # Handle DataParallel wrapped models
+    base_model = model.module if hasattr(model, "module") else model
+    for param in base_model.backbone.parameters():
         param.requires_grad = True
 
 
@@ -572,6 +583,13 @@ def train_fold(
     # Use channels-last memory format for better performance on MPS
     if device_type == DeviceType.MPS:
         model = model.to(memory_format=torch.channels_last)
+    
+    # Multi-GPU support with DataParallel
+    use_multi_gpu = getattr(cfg, "multi_gpu", False) and device_type == DeviceType.CUDA
+    num_gpus = torch.cuda.device_count() if use_multi_gpu else 1
+    if use_multi_gpu and num_gpus > 1:
+        model = nn.DataParallel(model)
+        print(f"Using DataParallel with {num_gpus} GPUs")
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model: 5-Head DINOv2 ({cfg.backbone})")
@@ -670,6 +688,7 @@ def train_fold(
     )
     
     # Training loop
+    select_by = getattr(cfg, "select_by", "loss")
     best_r2 = 0.0
     best_loss = float("inf")
     patience_counter = 0
@@ -764,15 +783,26 @@ def train_fold(
         save_ok = (current_stage == 2) or (not two_stage) or head_only_mode or freeze_backbone
         
         # Handle NaN - don't save if metrics are NaN
-        if save_ok and not np.isnan(r2) and r2 > best_r2:
+        # Model selection: by loss (lower better) or by r2 (higher better)
+        if select_by == "loss":
+            is_better = valid_loss < best_loss and not np.isnan(valid_loss)
+        else:  # r2
+            is_better = r2 > best_r2 and not np.isnan(r2)
+        
+        if save_ok and is_better:
             best_r2 = r2
             best_loss = valid_loss
             best_metrics_snapshot = {k: float(v) for k, v in metrics.items()}
             patience_counter = 0
             
             save_path = os.path.join(cfg.output_dir, f"5head_best_fold{fold}.pth")
-            torch.save(model.state_dict(), save_path)
-            print(f"  -> Saved best model (Competition R²: {best_r2:.4f})")
+            # Unwrap DataParallel for saving
+            model_to_save = model.module if hasattr(model, "module") else model
+            torch.save(model_to_save.state_dict(), save_path)
+            if select_by == "loss":
+                print(f"  -> Saved best model (Loss: {best_loss:.4f}, R²: {best_r2:.4f})")
+            else:
+                print(f"  -> Saved best model (R²: {best_r2:.4f}, Loss: {best_loss:.4f})")
         elif save_ok:
             patience_counter += 1
         
@@ -870,8 +900,8 @@ def main() -> None:
                         help="Weight for balance penalty in BalancedMSELoss")
     parser.add_argument("--no-huber-for-dead", action="store_true", help="Disable Huber loss for dead target")
     parser.add_argument("--target-weights", type=float, nargs=5, 
-                        default=[0.2, 0.2, 0.2, 0.2, 0.2],
-                        help="Loss weights for [green, dead, clover, gdm, total]")
+                        default=[0.1, 0.1, 0.1, 0.2, 0.5],
+                        help="Loss weights for [green, dead, clover, gdm, total] - default matches competition")
     
     # Post-processing
     parser.add_argument("--correction-threshold", type=float, default=0.15)
@@ -907,9 +937,19 @@ def main() -> None:
     parser.add_argument("--train-folds", type=int, nargs="+", default=[0, 1, 2, 3, 4])
     parser.add_argument("--cv-strategy", type=str, default="group_date_state",
                         help="CV strategy: group_date_state (default), group_month, group_date, stratified, random")
+    parser.add_argument("--fold-csv", type=str, default=None,
+                        help="Path to CSV with pre-defined folds (must have 'sample_id_prefix' and 'fold' columns)")
     
     # Device
     parser.add_argument("--device-type", type=str, default=None, choices=["cuda", "mps", "cpu"])
+    parser.add_argument("--multi-gpu", action="store_true", 
+                        help="Use DataParallel for multi-GPU training (CUDA only)")
+    
+    # Model selection
+    parser.add_argument("--select-by", type=str, default="loss", choices=["loss", "r2"],
+                        help="Criterion for selecting best model: 'loss' (lower better) or 'r2' (higher better)")
+    parser.add_argument("--compute-oof", action="store_true",
+                        help="Compute true OOF metrics after training completes")
     
     # Misc
     parser.add_argument("--seed", type=int, default=18)
@@ -979,12 +1019,42 @@ def main() -> None:
     # Load data
     print("\nPreparing data...")
     df = prepare_dataframe(args.train_csv)
-    df = create_folds(df, n_folds=args.num_folds, seed=args.seed, cv_strategy=args.cv_strategy)
+    
+    # Use pre-defined folds from CSV or create new folds
+    if args.fold_csv:
+        print(f"Loading pre-defined folds from: {args.fold_csv}")
+        fold_df = pd.read_csv(args.fold_csv)
+        # Merge fold assignments on sample_id_prefix
+        if "sample_id_prefix" in fold_df.columns and "fold" in fold_df.columns:
+            fold_mapping = fold_df.set_index("sample_id_prefix")["fold"].to_dict()
+            df["fold"] = df["sample_id_prefix"].map(fold_mapping)
+            # Check for unmapped samples
+            unmapped = df["fold"].isna().sum()
+            if unmapped > 0:
+                print(f"WARNING: {unmapped} samples not found in fold CSV, assigning to fold 0")
+                df["fold"] = df["fold"].fillna(0).astype(int)
+            else:
+                df["fold"] = df["fold"].astype(int)
+        else:
+            raise ValueError("fold_csv must have 'sample_id_prefix' and 'fold' columns")
+    else:
+        df = create_folds(df, n_folds=args.num_folds, seed=args.seed, cv_strategy=args.cv_strategy)
+    
     print(f"Total samples: {len(df)}")
     print(f"Fold distribution:\n{df['fold'].value_counts().sort_index()}")
     
     # Save folds
     df.to_csv(os.path.join(args.output_dir, "folds.csv"), index=False)
+    
+    # Initialize OOF tracking if enabled
+    n_samples = len(df)
+    oof_preds = np.full((n_samples, 5), np.nan, dtype=np.float32) if args.compute_oof else None
+    oof_targets = np.zeros((n_samples, 5), dtype=np.float32) if args.compute_oof else None
+    oof_filled = np.zeros(n_samples, dtype=bool) if args.compute_oof else None
+    
+    if args.compute_oof:
+        image_dir = os.path.join(args.base_path, "train")
+        oof_transform = get_val_transform(args.img_size)
     
     # Train
     results = []
@@ -994,6 +1064,53 @@ def main() -> None:
         
         result = train_fold(fold, train_df, valid_df, args, device, device_type)
         results.append(result)
+        
+        # Compute OOF for this fold immediately after training
+        if args.compute_oof:
+            ckpt_path = os.path.join(args.output_dir, f"5head_best_fold{fold}.pth")
+            if os.path.exists(ckpt_path):
+                print(f"\n  Computing OOF predictions for fold {fold}...")
+                
+                # Load best model for this fold
+                model = load_oof_model(
+                    ckpt_path, args.backbone, device,
+                    grid=tuple(args.grid), dropout=args.dropout, hidden_ratio=args.hidden_ratio
+                )
+                
+                # Get validation indices and predictions
+                val_mask = df["fold"] == fold
+                val_indices = df.index[val_mask].tolist()
+                val_df_oof = df[val_mask].reset_index(drop=True)
+                
+                val_ds = OOFDataset(val_df_oof, image_dir, oof_transform)
+                val_loader = DataLoader(
+                    val_ds, batch_size=args.batch_size, shuffle=False,
+                    num_workers=args.num_workers, pin_memory=device.type == "cuda"
+                )
+                
+                fold_preds, fold_targets = predict_oof_fold(model, val_loader, device, desc=f"  OOF Fold {fold}")
+                
+                # Store in OOF arrays
+                for i, idx in enumerate(val_indices):
+                    oof_preds[idx] = fold_preds[i]
+                    oof_targets[idx] = fold_targets[i]
+                    oof_filled[idx] = True
+                
+                # Cleanup
+                del model
+                gc.collect()
+                empty_cache(device_type)
+                
+                # Compute cumulative OOF metrics
+                filled_mask = oof_filled
+                if filled_mask.sum() > 0:
+                    oof_metrics = compute_metrics(oof_preds[filled_mask], oof_targets[filled_mask])
+                    n_filled = filled_mask.sum()
+                    pct_filled = 100.0 * n_filled / n_samples
+                    print(f"\n  OOF after fold {fold} ({n_filled}/{n_samples} = {pct_filled:.0f}% samples):")
+                    print(f"    Weighted R²: {oof_metrics['weighted_r2']:.4f} | "
+                          f"G={oof_metrics['r2_green']:.3f}, D={oof_metrics['r2_dead']:.3f}, "
+                          f"C={oof_metrics['r2_clover']:.3f}, GDM={oof_metrics['r2_gdm']:.3f}, T={oof_metrics['r2_total']:.3f}")
     
     # Summary
     print("\n" + "=" * 60)
@@ -1019,7 +1136,7 @@ def main() -> None:
     print("-" * 60)
     print(f"CV Mean Comp.R²: {np.mean(r2_scores):.4f} ± {np.std(r2_scores):.4f}")
     print(f"CV Mean Loss: {np.mean(loss_scores):.4f} ± {np.std(loss_scores):.4f}")
-    print("\nNOTE: Run eval_5head_oof.py for true OOF R² (may be ~0.05-0.10 lower)")
+    print(f"Model selection: by {args.select_by}")
     
     # Save results
     results_summary = {
@@ -1077,6 +1194,48 @@ def main() -> None:
         json.dump(results_summary, f, indent=2)
     
     print(f"\nResults saved to {args.output_dir}")
+    
+    # Final OOF summary (already computed during training)
+    if args.compute_oof and oof_filled is not None and oof_filled.all():
+        oof_metrics_raw = compute_metrics(oof_preds, oof_targets)
+        
+        print("\n" + "=" * 60)
+        print("Final OOF Results (Raw Predictions)")
+        print("=" * 60)
+        for name in ["Green", "Dead", "Clover", "GDM", "Total"]:
+            r2 = oof_metrics_raw[f"r2_{name.lower()}"]
+            rmse = oof_metrics_raw[f"rmse_{name.lower()}"]
+            mae = oof_metrics_raw[f"mae_{name.lower()}"]
+            print(f"  {name:8s}: R² = {r2:7.4f}, RMSE = {rmse:7.2f}, MAE = {mae:7.2f}")
+        print(f"\n  Weighted R²: {oof_metrics_raw['weighted_r2']:.4f}")
+        
+        # Save OOF predictions
+        oof_df_out = df[["sample_id_prefix", "fold"]].copy()
+        oof_df_out["pred_green"] = oof_preds[:, 0]
+        oof_df_out["pred_dead"] = oof_preds[:, 1]
+        oof_df_out["pred_clover"] = oof_preds[:, 2]
+        oof_df_out["pred_gdm"] = oof_preds[:, 3]
+        oof_df_out["pred_total"] = oof_preds[:, 4]
+        oof_df_out["true_green"] = oof_targets[:, 0]
+        oof_df_out["true_dead"] = oof_targets[:, 1]
+        oof_df_out["true_clover"] = oof_targets[:, 2]
+        oof_df_out["true_gdm"] = oof_targets[:, 3]
+        oof_df_out["true_total"] = oof_targets[:, 4]
+        
+        oof_path = os.path.join(args.output_dir, "oof_predictions.csv")
+        oof_df_out.to_csv(oof_path, index=False)
+        print(f"\nOOF predictions saved to: {oof_path}")
+        
+        # Save OOF metrics
+        oof_metrics_path = os.path.join(args.output_dir, "oof_metrics.json")
+        with open(oof_metrics_path, "w") as f:
+            json.dump({"raw": oof_metrics_raw}, f, indent=2)
+        print(f"OOF metrics saved to: {oof_metrics_path}")
+        
+        # Update results summary with OOF
+        results_summary["oof_metrics"] = {"raw": oof_metrics_raw}
+        with open(os.path.join(args.output_dir, "results.json"), "w") as f:
+            json.dump(results_summary, f, indent=2)
 
 
 if __name__ == "__main__":
