@@ -50,99 +50,7 @@ The test set does **not** provide State, Month, or Species information. This mea
 
 ---
 
-## 🎯 Finalized High-Impact List (Implement First)
-
-| Priority | Improvement | Expected Gain | Effort | Status |
-|----------|-------------|---------------|--------|--------|
-| **1** | **Log-Scale Targets** (`log1p` for Dead/Clover) | 🔥 High | Low | ⬜ |
-| **2** | **TTA at Inference** (flip + stereo swap) | 🔥 High | Low | ⬜ |
-| **3** | **5-Fold Ensemble** (average all fold predictions) | 🔥 High | Low | ⬜ |
-| **4** | **Physics Post-Processing** (`dead = total - gdm`) | Medium-High | Low | ⬜ |
-| **5** | **MixUp Augmentation** | Medium | Medium | ⬜ |
-| **6** | **Grid 3x3** (vs current 2x2) | Medium | Low | ⬜ |
-
-### Why These?
-
-1. **Log-Scale Targets** — Dead/Clover are heavily skewed (many zeros). Training on `log1p(target)` dramatically improves predictions. **Likely the single biggest win.**
-
-2. **TTA** — Free ~1-3% boost. Horizontal flip + vertical flip + stereo swap averaging.
-
-3. **5-Fold Ensemble** — Standard competition technique. Average predictions from all 5 folds.
-
-4. **Physics Post-Processing** — `dead = total - gdm` is a hard constraint. Derive dead when predictions are inconsistent.
-
-5. **MixUp** — Strong regularization for regression with limited data.
-
-6. **Grid 3x3** — More tiles = more spatial resolution.
-
-### Skip/Defer
-
-| Item | Reason |
-|------|--------|
-| Multi-scale features | Significant code changes, uncertain gain |
-| Cross-attention | Complex, may not beat FiLM |
-| Uncertainty heads | More useful for calibration than raw RMSE |
-| Knowledge distillation | Too complex for uncertain payoff |
-
----
-
 ## Proposed Improvements
-
-## ✅ Finalized "Big Impact" Shortlist (Recommended Order)
-
-These are the changes most likely to move the leaderboard **materially**, given the current 5-head setup and the constraint that **no metadata is available at inference**.
-
-### 1) Ensemble + TTA at inference (Highest ROI)
-
-- **Why**: Most reliable way to reduce variance and improve LB without changing training dynamics.
-- **Do**
-  - **5-fold CV ensemble**: average predictions from the best checkpoint of each fold
-  - **Grid-size ensemble**: average 2×2 + 3×3 (optionally 2×3)
-  - **Light TTA**: hflip + vflip + **stereo swap**
-
-### 2) Two-stage training (freeze → finetune backbone)
-
-- **Why**: Frozen DINOv2 often saturates; controlled finetuning typically unlocks meaningful gains.
-- **Do**
-  - Stage 1: freeze backbone, train heads/conditioning
-  - Stage 2: unfreeze with **very low backbone LR** (e.g., 1e-5) and short schedule
-
-### 3) Target transform for skewed heads (Dead, Clover)
-
-- **Why**: Dead/Clover are long-tailed with many zeros; plain MSE tends to mis-handle skew.
-- **Do**
-  - Train in **log1p space** for those heads (or for all heads if you want simplicity)
-- **Alternative**
-  - Two-part modeling (zero vs non-zero) for Dead/Clover (more effort, can help)
-
-### 4) Physics-consistent post-processing (no metadata dependency)
-
-- **Why**: Enforces known relationships at inference without any missing metadata.
-- **Do**
-  - Use constraints like **dead ≈ relu(total − gdm)**
-  - Apply corrections **only when inconsistency is high** (avoid over-correcting)
-  - Clamp to plausible bounds (based on train distribution) as a safety guardrail
-
-### 5) Auxiliary heads = training regularization only (avoid inference coupling)
-
-- **Why**: Multi-task regularization can help features; using predicted metadata to adjust outputs can hurt via error propagation.
-- **Do**
-  - Keep `--use-aux-heads` and tune weights
-  - **Do not** apply context adjustment at inference
-
----
-
-## Medium Impact (Good after the shortlist)
-
-- **Stereo swap augmentation** (train-time): cheap and usually safe for paired views
-- **MixUp / CutMix** (train-time): can help generalization; ensure paired consistency across left/right
-- **CV hardening**: leave-one-state-out / leave-one-month-out to detect leakage/overfit-to-split
-
-## Lower ROI / Higher Risk (Do later)
-
-- Cross-attention replacing FiLM
-- Multi-scale feature concatenation from intermediate ViT blocks
-- Uncertainty heads / heteroscedastic regression loss
 
 ### 1. Training Strategy (High Impact)
 
@@ -394,43 +302,20 @@ python -m src.train_5head \
 
 ## Priority Implementation Order
 
-<<<<<<< Current (Your changes)
 1. **High Priority** (Quick wins)
    - [ ] Disable `apply_context_adjustment` at inference
-   - [ ] Add **TTA** at inference (hflip, vflip, stereo swap)
-   - [ ] Do **fold ensemble** + **grid-size ensemble** (2x2 + 3x3, optionally 2x3)
-   - [ ] Add **physics-based post-processing** (e.g., `dead = relu(total - gdm)` when inconsistent)
-   - [ ] Test **log1p target** training for skewed heads (Dead, Clover)
-   - [ ] Run **two-stage** training (freeze → finetune backbone with low backbone LR)
-   - [ ] Test grid 3x3 vs 2x2 (and keep for ensemble if both help)
+   - [ ] Add `--always-correct-dead` flag
+   - [ ] Test grid 3x3 vs 2x2
 
 2. **Medium Priority** (Moderate effort)
    - [ ] Add stereo swap augmentation
-   - [ ] Implement MixUp / CutMix (paired-consistent)
-   - [ ] Stress-test CV splits (leave-one-state-out / leave-one-month-out)
+   - [ ] Implement MixUp
+   - [ ] Add TTA at inference
 
 3. **Lower Priority** (Significant effort)
    - [ ] Multi-scale feature extraction
    - [ ] Cross-attention for stereo
    - [ ] Uncertainty estimation heads
-=======
-### 🔥 Phase 1: Quick Wins (Do Now)
-- [ ] **Log-scale targets** — Add `--use-log-targets` flag, transform Dead/Clover with `log1p`
-- [ ] **TTA at inference** — Implement in inference notebook (flip + stereo swap)
-- [ ] **5-fold ensemble** — Train all folds, average predictions
-- [ ] **Physics post-processing** — `dead = total - gdm` correction
-
-### ⚡ Phase 2: Moderate Effort
-- [ ] **MixUp augmentation** — Add `--use-mixup` flag
-- [ ] **Stereo swap augmentation** — 50% probability in dataset
-- [ ] **Grid 3x3 experiment** — Compare vs 2x2
-
-### 🔧 Phase 3: Defer (Uncertain ROI)
-- [ ] Multi-scale feature extraction
-- [ ] Cross-attention for stereo
-- [ ] Uncertainty estimation heads
-- [ ] Knowledge distillation
->>>>>>> Incoming (Background Agent changes)
 
 ---
 

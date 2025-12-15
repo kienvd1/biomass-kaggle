@@ -6,10 +6,12 @@ This script performs proper OOF evaluation:
 - Each sample is predicted using only the model that was NOT trained on it
 - Computes per-target and weighted R² metrics
 - Applies Dead derivation fix: Dead = Total - GDM
+- Optional TTA (Test Time Augmentation) with 3 views
 
 Usage:
     python -m src.eval_5head_oof --model-dir ./outputs/5head_20251213_170453
     python -m src.eval_5head_oof --model-dir ./outputs/5head_20251213_170453 --derive-dead
+    python -m src.eval_5head_oof --model-dir ./outputs/5head_20251213_170453 --tta --derive-dead
 """
 import argparse
 import gc
@@ -78,6 +80,36 @@ def get_val_transform(img_size: int = 518) -> A.Compose:
         A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2(),
     ])
+
+
+def get_tta_transforms(img_size: int = 518) -> List[A.Compose]:
+    """Get TTA (Test Time Augmentation) transforms.
+    
+    Returns 3 views: original, horizontal flip, vertical flip.
+    """
+    base = [
+        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ToTensorV2(),
+    ]
+    
+    original = A.Compose([
+        A.Resize(img_size, img_size, interpolation=cv2.INTER_AREA),
+        *base,
+    ])
+    
+    hflip = A.Compose([
+        A.HorizontalFlip(p=1.0),
+        A.Resize(img_size, img_size, interpolation=cv2.INTER_AREA),
+        *base,
+    ])
+    
+    vflip = A.Compose([
+        A.VerticalFlip(p=1.0),
+        A.Resize(img_size, img_size, interpolation=cv2.INTER_AREA),
+        *base,
+    ])
+    
+    return [original, hflip, vflip]
 
 
 # ============== Model ==============
@@ -346,6 +378,7 @@ def predict_fold(
     model: nn.Module,
     loader: DataLoader,
     device: torch.device,
+    desc: str = "  Predicting",
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Run inference for a single fold."""
     model.eval()
@@ -355,7 +388,7 @@ def predict_fold(
     use_amp = device.type == "cuda"
     amp_device = "cuda" if use_amp else "cpu"
 
-    for x_left, x_right, targets in tqdm(loader, desc="  Predicting", leave=False):
+    for x_left, x_right, targets in tqdm(loader, desc=desc, leave=False):
         x_left = x_left.to(device, non_blocking=True)
         x_right = x_right.to(device, non_blocking=True)
 
@@ -368,6 +401,50 @@ def predict_fold(
         all_targets.append(targets.numpy())
 
     return np.concatenate(all_preds, axis=0), np.concatenate(all_targets, axis=0)
+
+
+@torch.no_grad()
+def predict_fold_with_tta(
+    model: nn.Module,
+    val_df: pd.DataFrame,
+    image_dir: str,
+    device: torch.device,
+    batch_size: int = 4,
+    num_workers: int = 4,
+    img_size: int = 518,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Run inference with TTA (Test Time Augmentation).
+    
+    Averages predictions from 3 views: original, horizontal flip, vertical flip.
+    """
+    model.eval()
+    tta_transforms = get_tta_transforms(img_size)
+    
+    tta_preds = []
+    targets = None
+    
+    for i, transform in enumerate(tta_transforms):
+        view_name = ["original", "hflip", "vflip"][i]
+        
+        # Create dataset and loader for this TTA view
+        ds = OOFDataset(val_df, image_dir, transform)
+        loader = DataLoader(
+            ds, batch_size=batch_size, shuffle=False,
+            num_workers=num_workers, pin_memory=device.type == "cuda"
+        )
+        
+        # Predict
+        preds, tgts = predict_fold(model, loader, device, desc=f"  TTA {view_name}")
+        tta_preds.append(preds)
+        
+        # Only need targets once (they're the same for all views)
+        if targets is None:
+            targets = tgts
+    
+    # Average TTA predictions
+    final_preds = np.mean(tta_preds, axis=0)
+    
+    return final_preds, targets
 
 
 def compute_metrics(
@@ -430,11 +507,16 @@ def run_oof_evaluation(
     grid: Tuple[int, int] = (2, 2),
     dropout: float = 0.2,
     hidden_ratio: float = 0.5,
+    use_tta: bool = False,
+    img_size: int = 518,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, pd.DataFrame]:
     """
     Run proper OOF evaluation.
 
     Each sample is predicted using only the fold model that was NOT trained on it.
+    
+    Args:
+        use_tta: If True, use TTA (3 views: original, hflip, vflip) and average predictions.
     """
     # Load folds CSV
     folds_csv = os.path.join(model_dir, "folds.csv")
@@ -446,7 +528,7 @@ def run_oof_evaluation(
     print(f"Fold distribution:\n{df['fold'].value_counts().sort_index()}")
 
     image_dir = os.path.join(data_dir, "train")
-    transform = get_val_transform(518)
+    transform = get_val_transform(img_size)
 
     # Initialize OOF arrays
     n_samples = len(df)
@@ -462,6 +544,8 @@ def run_oof_evaluation(
 
         print(f"\n{'='*60}")
         print(f"Fold {fold}: Loading model and predicting validation set")
+        if use_tta:
+            print(f"  TTA: Enabled (3 views: original, hflip, vflip)")
         print(f"{'='*60}")
 
         # Load model
@@ -478,15 +562,20 @@ def run_oof_evaluation(
 
         print(f"  Validation samples: {len(val_df)}")
 
-        # Create dataloader
-        val_ds = OOFDataset(val_df, image_dir, transform)
-        val_loader = DataLoader(
-            val_ds, batch_size=batch_size, shuffle=False,
-            num_workers=num_workers, pin_memory=device.type == "cuda"
-        )
-
-        # Predict
-        fold_preds, fold_targets = predict_fold(model, val_loader, device)
+        if use_tta:
+            # Predict with TTA (3 views averaged)
+            fold_preds, fold_targets = predict_fold_with_tta(
+                model, val_df, image_dir, device,
+                batch_size=batch_size, num_workers=num_workers, img_size=img_size
+            )
+        else:
+            # Standard prediction (single view)
+            val_ds = OOFDataset(val_df, image_dir, transform)
+            val_loader = DataLoader(
+                val_ds, batch_size=batch_size, shuffle=False,
+                num_workers=num_workers, pin_memory=device.type == "cuda"
+            )
+            fold_preds, fold_targets = predict_fold(model, val_loader, device)
 
         # Store in OOF arrays
         for i, idx in enumerate(val_indices):
@@ -524,8 +613,39 @@ def main():
     parser.add_argument("--dropout", type=float, default=0.2)
     parser.add_argument("--hidden-ratio", type=float, default=0.5)
     parser.add_argument("--device", type=str, default=None, choices=["cuda", "mps", "cpu"])
+    parser.add_argument("--tta", action="store_true", help="Use TTA (3 views: original, hflip, vflip)")
+    parser.add_argument("--img-size", type=int, default=518, help="Image size for inference")
 
     args = parser.parse_args()
+
+    # Auto-load config from results.json if available
+    results_path = os.path.join(args.model_dir, "results.json")
+    if os.path.exists(results_path):
+        print(f"Loading config from {results_path}")
+        with open(results_path) as f:
+            results = json.load(f)
+        
+        # Override defaults with training config
+        if "backbone" in results:
+            args.backbone = results["backbone"]
+        if "grid" in results:
+            args.grid = results["grid"]
+        if "dropout" in results:
+            args.dropout = results["dropout"]
+        if "hidden_ratio" in results:
+            args.hidden_ratio = results["hidden_ratio"]
+        if "num_folds" in results:
+            args.num_folds = results["num_folds"]
+        if "img_size" in results:
+            args.img_size = results["img_size"]
+        
+        print(f"  backbone: {args.backbone}")
+        print(f"  grid: {args.grid}")
+        print(f"  dropout: {args.dropout}")
+        print(f"  hidden_ratio: {args.hidden_ratio}")
+        print(f"  num_folds: {args.num_folds}")
+    else:
+        print(f"WARNING: results.json not found, using default/CLI config")
 
     # Device
     if args.device:
@@ -545,6 +665,8 @@ def main():
     print(f"Backbone: {args.backbone}")
     print(f"Device: {device}")
     print(f"Derive Dead: {args.derive_dead}")
+    print(f"TTA: {args.tta}")
+    print(f"Image size: {args.img_size}")
     print("="*60)
 
     # Run OOF evaluation
@@ -560,6 +682,8 @@ def main():
         grid=tuple(args.grid),
         dropout=args.dropout,
         hidden_ratio=args.hidden_ratio,
+        use_tta=args.tta,
+        img_size=args.img_size,
     )
 
     # Compute metrics

@@ -1,12 +1,14 @@
-# Dataset
-data/
+# Dataset - ignore contents but keep trainfold CSV
+data/*
+!data/trainfold*.csv
 *.zip
 
 # Outputs
 outputs/
 
-# CSV files
+# CSV files (except trainfold)
 *.csv
+!data/trainfold*.csv
 
 # Python
 .venv/

@@ -1,5 +1,6 @@
 """Dataset classes for CSIRO Biomass training."""
 import os
+import random
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -58,15 +59,31 @@ class BiomassDataset(Dataset):
         is_train: bool = True,
         cache_images: bool = False,
         return_aux_labels: bool = False,
+        use_log_target: bool = False,
+        stereo_swap_prob: float = 0.0,
+        photometric_transform: Optional[A.Compose] = None,
+        mixup_prob: float = 0.0,
+        mixup_alpha: float = 0.4,
+        cutmix_prob: float = 0.0,
+        cutmix_alpha: float = 1.0,
+        mix_same_context: bool = True,
     ) -> None:
         """
         Args:
             df: DataFrame with columns [image_path, Dry_Green_g, Dry_Dead_g, Dry_Clover_g, GDM_g, Dry_Total_g]
             image_dir: Directory containing images
-            transform: Albumentations transform
+            transform: Albumentations transform (geometric + normalize for stereo-correct mode)
             is_train: Whether this is training data
             cache_images: If True, cache all images in RAM (use when you have >16GB free RAM)
             return_aux_labels: If True, return State and Month labels for auxiliary heads
+            use_log_target: If True, apply log1p to targets (for long-tail distributions)
+            stereo_swap_prob: Probability of swapping left/right images (0.0 to disable)
+            photometric_transform: Separate photometric transforms applied independently per view
+            mixup_prob: Probability of applying MixUp (0.0 to disable)
+            mixup_alpha: Beta distribution alpha for MixUp lambda sampling
+            cutmix_prob: Probability of applying CutMix (0.0 to disable)
+            cutmix_alpha: Beta distribution alpha for CutMix lambda sampling
+            mix_same_context: If True, only mix samples with same species AND month
         """
         self.df = df.reset_index(drop=True)
         self.image_dir = image_dir
@@ -74,6 +91,14 @@ class BiomassDataset(Dataset):
         self.is_train = is_train
         self.cache_images = cache_images
         self.return_aux_labels = return_aux_labels
+        self.use_log_target = use_log_target
+        self.stereo_swap_prob = stereo_swap_prob
+        self.photometric_transform = photometric_transform
+        self.mixup_prob = mixup_prob
+        self.mixup_alpha = mixup_alpha
+        self.cutmix_prob = cutmix_prob
+        self.cutmix_alpha = cutmix_alpha
+        self.mix_same_context = mix_same_context
         self._cache: Dict[int, np.ndarray] = {}
         
         self.paths = self.df["image_path"].values
@@ -91,7 +116,8 @@ class BiomassDataset(Dataset):
 
             # Month labels (from Sampling_Date_Month column)
             if "Sampling_Date_Month" in self.df.columns:
-                self.month_labels = self.df["Sampling_Date_Month"].astype(int).map(self.MONTH_LABELS).values.astype(np.int64)
+                # Map months to class indices, fill unmapped months with 0
+                self.month_labels = self.df["Sampling_Date_Month"].astype(int).map(self.MONTH_LABELS).fillna(0).values.astype(np.int64)
             else:
                 self.month_labels = np.zeros(len(self.df), dtype=np.int64)
 
@@ -100,6 +126,11 @@ class BiomassDataset(Dataset):
                 self.species_labels = self.df["Species"].map(self.SPECIES_LABELS).fillna(7).values.astype(np.int64)
             else:
                 self.species_labels = np.zeros(len(self.df), dtype=np.int64)
+        
+        # Build context index for constrained MixUp/CutMix (same species + month + state)
+        self._context_index: Dict[Tuple[int, int, int], List[int]] = {}
+        if self.is_train and (self.mixup_prob > 0 or self.cutmix_prob > 0) and self.mix_same_context:
+            self._build_context_index()
         
         # Pre-cache all images if enabled
         if self.cache_images:
@@ -110,6 +141,97 @@ class BiomassDataset(Dataset):
     
     def __len__(self) -> int:
         return len(self.df)
+    
+    def _build_context_index(self) -> None:
+        """Build index mapping (species_label, month_label, state_label) -> list of sample indices.
+        
+        Used for constrained MixUp/CutMix to only mix samples with same species, month, AND state.
+        """
+        # Get species, month, and state for all samples
+        if "Species" in self.df.columns:
+            species = self.df["Species"].map(self.SPECIES_LABELS).fillna(7).values.astype(int)
+        else:
+            species = np.zeros(len(self.df), dtype=int)
+        
+        if "Sampling_Date_Month" in self.df.columns:
+            month = self.df["Sampling_Date_Month"].astype(int).map(self.MONTH_LABELS).fillna(0).values.astype(int)
+        else:
+            month = np.zeros(len(self.df), dtype=int)
+        
+        if "State" in self.df.columns:
+            state = self.df["State"].map(self.STATE_LABELS).fillna(0).values.astype(int)
+        else:
+            state = np.zeros(len(self.df), dtype=int)
+        
+        # Build index with (species, month, state) as key
+        for idx in range(len(self.df)):
+            key = (int(species[idx]), int(month[idx]), int(state[idx]))
+            if key not in self._context_index:
+                self._context_index[key] = []
+            self._context_index[key].append(idx)
+        
+        # Log statistics
+        valid_groups = {k: v for k, v in self._context_index.items() if len(v) > 1}
+        print(f"MixUp/CutMix context index: {len(valid_groups)} groups (species×month×state) with 2+ samples "
+              f"(total {sum(len(v) for v in valid_groups.values())} samples eligible)")
+    
+    def _get_mix_partner(self, idx: int) -> Optional[int]:
+        """Get a random sample index with same species, month, AND state for mixing."""
+        if not self.mix_same_context:
+            # Random partner from entire dataset
+            partner = random.randint(0, len(self.df) - 1)
+            return partner if partner != idx else None
+        
+        # Get species, month, and state for current sample
+        row = self.df.iloc[idx]
+        
+        if "Species" in self.df.columns:
+            species = self.SPECIES_LABELS.get(row.get("Species", "Mixed"), 7)
+        else:
+            species = 0
+        
+        if "Sampling_Date_Month" in self.df.columns:
+            month_val = int(row["Sampling_Date_Month"])
+            month = self.MONTH_LABELS.get(month_val, 0)
+        else:
+            month = 0
+        
+        if "State" in self.df.columns:
+            state = self.STATE_LABELS.get(row.get("State", "NSW"), 0)
+        else:
+            state = 0
+        
+        key = (species, month, state)
+        candidates = self._context_index.get(key, [])
+        
+        # Need at least 2 samples (current + 1 partner)
+        if len(candidates) < 2:
+            return None
+        
+        # Pick random partner (excluding self)
+        candidates = [c for c in candidates if c != idx]
+        if not candidates:
+            return None
+        
+        return random.choice(candidates)
+    
+    def _rand_bbox(self, h: int, w: int, lam: float) -> Tuple[int, int, int, int]:
+        """Generate random bounding box for CutMix."""
+        cut_rat = np.sqrt(1.0 - lam)
+        cut_h = int(h * cut_rat)
+        cut_w = int(w * cut_rat)
+        
+        # Center of the box
+        cy = random.randint(0, h)
+        cx = random.randint(0, w)
+        
+        # Box coordinates (clipped to image bounds)
+        y1 = max(0, cy - cut_h // 2)
+        y2 = min(h, cy + cut_h // 2)
+        x1 = max(0, cx - cut_w // 2)
+        x2 = min(w, cx + cut_w // 2)
+        
+        return y1, y2, x1, x2
     
     def _load_image(self, idx: int) -> np.ndarray:
         """Load image from disk or cache. Uses TurboJPEG if available for speed."""
@@ -160,12 +282,27 @@ class BiomassDataset(Dataset):
         left = img[:, :mid]
         right = img[:, mid:]
 
+        # Stereo swap augmentation: randomly swap left/right views
+        # This works because FiLM/attention pooling don't assume L/R order
+        if self.is_train and self.stereo_swap_prob > 0 and random.random() < self.stereo_swap_prob:
+            left, right = right, left
+
         if self.transform:
-            # Apply same spatial transform to both views
             if self.is_train:
+                # Apply same geometric transform to both views (via replay)
                 replay = self.transform(image=left)
                 left_t = replay["image"]
                 right_t = self.transform.replay(replay["replay"], image=right)["image"]
+                
+                # Apply photometric transforms INDEPENDENTLY per view (stereo-correct)
+                if self.photometric_transform is not None:
+                    # Convert back to numpy for photometric aug
+                    left_np = left_t.permute(1, 2, 0).numpy()
+                    right_np = right_t.permute(1, 2, 0).numpy()
+                    
+                    # Apply independent photometric transforms
+                    left_t = self.photometric_transform(image=left_np)["image"]
+                    right_t = self.photometric_transform(image=right_np)["image"]
             else:
                 left_t = self.transform(image=left)["image"]
                 right_t = self.transform(image=right)["image"]
@@ -173,9 +310,70 @@ class BiomassDataset(Dataset):
             left_t = torch.from_numpy(left.transpose(2, 0, 1)).float() / 255.0
             right_t = torch.from_numpy(right.transpose(2, 0, 1)).float() / 255.0
 
-        targets = torch.tensor(self.targets[idx], dtype=torch.float32)
+        targets_raw = self.targets[idx].copy()
+        
+        # MixUp/CutMix augmentation (training only, same species/month/state)
+        mix_lambda = 1.0  # Default: no mixing
+        if self.is_train:
+            do_mixup = self.mixup_prob > 0 and random.random() < self.mixup_prob
+            do_cutmix = self.cutmix_prob > 0 and random.random() < self.cutmix_prob
+            
+            if do_mixup or do_cutmix:
+                partner_idx = self._get_mix_partner(idx)
+                
+                if partner_idx is not None:
+                    # Load and transform partner image
+                    partner_img = self._load_image(partner_idx)
+                    ph, pw, _ = partner_img.shape
+                    pmid = pw // 2
+                    partner_left = partner_img[:, :pmid]
+                    partner_right = partner_img[:, pmid:]
+                    
+                    if self.transform:
+                        preplay = self.transform(image=partner_left)
+                        partner_left_t = preplay["image"]
+                        partner_right_t = self.transform.replay(preplay["replay"], image=partner_right)["image"]
+                        
+                        if self.photometric_transform is not None:
+                            pl_np = partner_left_t.permute(1, 2, 0).numpy()
+                            pr_np = partner_right_t.permute(1, 2, 0).numpy()
+                            partner_left_t = self.photometric_transform(image=pl_np)["image"]
+                            partner_right_t = self.photometric_transform(image=pr_np)["image"]
+                    else:
+                        partner_left_t = torch.from_numpy(partner_left.transpose(2, 0, 1)).float() / 255.0
+                        partner_right_t = torch.from_numpy(partner_right.transpose(2, 0, 1)).float() / 255.0
+                    
+                    partner_targets = self.targets[partner_idx].copy()
+                    
+                    if do_cutmix:
+                        # CutMix: paste rectangular region from partner
+                        mix_lambda = np.random.beta(self.cutmix_alpha, self.cutmix_alpha)
+                        _, h_t, w_t = left_t.shape
+                        y1, y2, x1, x2 = self._rand_bbox(h_t, w_t, mix_lambda)
+                        
+                        # Apply same cutout region to both L/R images
+                        left_t[:, y1:y2, x1:x2] = partner_left_t[:, y1:y2, x1:x2]
+                        right_t[:, y1:y2, x1:x2] = partner_right_t[:, y1:y2, x1:x2]
+                        
+                        # Adjust lambda based on actual area
+                        mix_lambda = 1 - ((y2 - y1) * (x2 - x1)) / (h_t * w_t)
+                    else:
+                        # MixUp: weighted average of images
+                        mix_lambda = np.random.beta(self.mixup_alpha, self.mixup_alpha)
+                        left_t = mix_lambda * left_t + (1 - mix_lambda) * partner_left_t
+                        right_t = mix_lambda * right_t + (1 - mix_lambda) * partner_right_t
+                    
+                    # Mix targets with same lambda
+                    targets_raw = mix_lambda * targets_raw + (1 - mix_lambda) * partner_targets
+        
+        # Apply log1p transformation for long-tail target distribution
+        if self.use_log_target:
+            targets_raw = np.log1p(targets_raw)
+        
+        targets = torch.tensor(targets_raw, dtype=torch.float32)
 
         if self.return_aux_labels:
+            # For constrained mixing, aux labels are the same (same species/month/state)
             state_label = torch.tensor(self.state_labels[idx], dtype=torch.long)
             month_label = torch.tensor(self.month_labels[idx], dtype=torch.long)
             species_label = torch.tensor(self.species_labels[idx], dtype=torch.long)
@@ -185,7 +383,12 @@ class BiomassDataset(Dataset):
 
 
 def get_train_transforms(img_size: int = 518, aug_prob: float = 0.5) -> A.ReplayCompose:
-    """Get training augmentations with replay support for consistent stereo augmentation."""
+    """Get training augmentations with replay support for consistent stereo augmentation.
+    
+    NOTE: This applies the SAME photometric transforms to both views (via replay),
+    which may allow the model to "cheat" by matching pixel noise. For stereo-correct
+    augmentations, use get_stereo_correct_transforms() instead.
+    """
     return A.ReplayCompose([
         A.Resize(img_size, img_size, interpolation=cv2.INTER_AREA),
         A.HorizontalFlip(p=aug_prob),
@@ -214,6 +417,57 @@ def get_train_transforms(img_size: int = 518, aug_prob: float = 0.5) -> A.Replay
         ),
         A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2(),
+    ])
+
+
+def get_stereo_geometric_transforms(img_size: int = 518, aug_prob: float = 0.5) -> A.ReplayCompose:
+    """Get GEOMETRIC-only transforms with replay support for stereo pairs.
+    
+    These transforms are applied identically to both L/R views to preserve stereo geometry.
+    Does NOT include normalization or ToTensorV2 - those are handled separately.
+    """
+    return A.ReplayCompose([
+        A.Resize(img_size, img_size, interpolation=cv2.INTER_AREA),
+        A.HorizontalFlip(p=aug_prob),
+        A.VerticalFlip(p=aug_prob),
+        A.Affine(
+            translate_percent={"x": (-0.1, 0.1), "y": (-0.1, 0.1)},
+            scale=(0.85, 1.15),
+            rotate=(-15, 15),
+            border_mode=cv2.BORDER_REFLECT_101,
+            p=aug_prob,
+        ),
+        A.CoarseDropout(
+            num_holes_range=(1, 8),
+            hole_height_range=(8, 32),
+            hole_width_range=(8, 32),
+            fill=0,
+            p=0.3,
+        ),
+        # No photometric transforms here - they'll be applied independently
+        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ToTensorV2(),
+    ])
+
+
+def get_stereo_photometric_transforms(aug_prob: float = 0.5) -> A.Compose:
+    """Get PHOTOMETRIC-only transforms applied INDEPENDENTLY to each stereo view.
+    
+    This prevents the model from "cheating" by matching identical noise/blur patterns
+    between left and right images.
+    
+    Input/output: normalized tensor (C, H, W) as numpy array.
+    """
+    return A.Compose([
+        A.OneOf([
+            A.GaussNoise(std_range=(0.02, 0.1), p=1.0),
+            A.GaussianBlur(blur_limit=(3, 5), p=1.0),
+        ], p=0.3),
+        A.OneOf([
+            A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=1.0),
+            A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=20, val_shift_limit=20, p=1.0),
+        ], p=aug_prob),
+        ToTensorV2(),  # Convert back to tensor
     ])
 
 

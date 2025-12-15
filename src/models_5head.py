@@ -476,6 +476,112 @@ class ConstrainedMSELoss(nn.Module):
         return main_loss
 
 
+class UncertaintyWeightedLoss(nn.Module):
+    """
+    Multi-task loss with learnable uncertainty weights (Kendall et al. 2018).
+    
+    Automatically balances per-target losses by learning task-specific uncertainties.
+    Loss_i = L_i / (2 * σ²_i) + log(σ_i)
+    
+    This helps when some targets are harder than others - the model learns
+    to weight easier tasks more while still learning harder ones.
+    """
+    
+    def __init__(
+        self,
+        n_targets: int = 5,
+        use_huber_for_dead: bool = True,
+        huber_delta: float = 5.0,
+    ) -> None:
+        super().__init__()
+        # Learnable log-variance per target (initialized to 0 = σ² = 1)
+        self.log_vars = nn.Parameter(torch.zeros(n_targets))
+        self.use_huber_for_dead = use_huber_for_dead
+        self.huber_delta = huber_delta
+    
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            pred: (B, 5) - green, dead, clover, gdm, total
+            target: (B, 5) - ground truth
+        """
+        # Compute per-target losses
+        green_pred, dead_pred, clover_pred, gdm_pred, total_pred = pred.unbind(dim=1)
+        green_gt, dead_gt, clover_gt, gdm_gt, total_gt = target.unbind(dim=1)
+        
+        loss_green = F.mse_loss(green_pred, green_gt, reduction='mean')
+        loss_clover = F.mse_loss(clover_pred, clover_gt, reduction='mean')
+        loss_gdm = F.mse_loss(gdm_pred, gdm_gt, reduction='mean')
+        loss_total = F.mse_loss(total_pred, total_gt, reduction='mean')
+        
+        if self.use_huber_for_dead:
+            loss_dead = F.huber_loss(dead_pred, dead_gt, delta=self.huber_delta, reduction='mean')
+        else:
+            loss_dead = F.mse_loss(dead_pred, dead_gt, reduction='mean')
+        
+        losses = torch.stack([loss_green, loss_dead, loss_clover, loss_gdm, loss_total])
+        
+        # Uncertainty weighting: L_i / (2 * exp(log_var_i)) + log_var_i / 2
+        # This learns to down-weight harder tasks while still optimizing them
+        precision = torch.exp(-self.log_vars)  # 1/σ²
+        weighted_losses = precision * losses + self.log_vars
+        
+        return weighted_losses.sum() / 2
+
+
+class BalancedMSELoss(nn.Module):
+    """
+    MSE loss with penalty for imbalanced per-target performance.
+    
+    Adds a variance penalty to encourage similar loss values across all targets,
+    preventing the model from only optimizing easy targets.
+    """
+    
+    def __init__(
+        self,
+        target_weights: List[float] = [0.2, 0.2, 0.2, 0.2, 0.2],
+        balance_weight: float = 0.1,
+        use_huber_for_dead: bool = True,
+        huber_delta: float = 5.0,
+    ) -> None:
+        super().__init__()
+        self.register_buffer("weights", torch.tensor(target_weights, dtype=torch.float32))
+        self.balance_weight = balance_weight
+        self.use_huber_for_dead = use_huber_for_dead
+        self.huber_delta = huber_delta
+    
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            pred: (B, 5) - green, dead, clover, gdm, total
+            target: (B, 5) - ground truth
+        """
+        weights = self.weights.to(pred.device)
+        
+        green_pred, dead_pred, clover_pred, gdm_pred, total_pred = pred.unbind(dim=1)
+        green_gt, dead_gt, clover_gt, gdm_gt, total_gt = target.unbind(dim=1)
+        
+        loss_green = F.mse_loss(green_pred, green_gt, reduction='mean')
+        loss_clover = F.mse_loss(clover_pred, clover_gt, reduction='mean')
+        loss_gdm = F.mse_loss(gdm_pred, gdm_gt, reduction='mean')
+        loss_total = F.mse_loss(total_pred, total_gt, reduction='mean')
+        
+        if self.use_huber_for_dead:
+            loss_dead = F.huber_loss(dead_pred, dead_gt, delta=self.huber_delta, reduction='mean')
+        else:
+            loss_dead = F.mse_loss(dead_pred, dead_gt, reduction='mean')
+        
+        per_target = torch.stack([loss_green, loss_dead, loss_clover, loss_gdm, loss_total])
+        
+        # Weighted main loss
+        main_loss = (weights * per_target).sum() / weights.sum()
+        
+        # Balance penalty: variance of per-target losses (encourages similar values)
+        balance_penalty = per_target.var()
+        
+        return main_loss + self.balance_weight * balance_penalty
+
+
 class FocalMSELoss(nn.Module):
     """
     Focal-style MSE that focuses on harder samples.

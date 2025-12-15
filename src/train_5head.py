@@ -36,7 +36,15 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from .dataset import BiomassDataset, create_folds, get_train_transforms, get_valid_transforms, prepare_dataframe
+from .dataset import (
+    BiomassDataset,
+    create_folds,
+    get_train_transforms,
+    get_stereo_geometric_transforms,
+    get_stereo_photometric_transforms,
+    get_valid_transforms,
+    prepare_dataframe,
+)
 from .device import (
     DeviceType,
     empty_cache,
@@ -48,10 +56,12 @@ from .device import (
 )
 from .models_5head import (
     AuxiliaryLoss,
+    BalancedMSELoss,
     ConstrainedMSELoss,
     DeadAwareLoss,
     DeadPostProcessor,
     FocalMSELoss,
+    UncertaintyWeightedLoss,
     build_5head_model,
 )
 from .trainer import compute_weighted_r2, compute_per_target_metrics_np
@@ -203,8 +213,14 @@ def validate(
     postprocessor: Optional[DeadPostProcessor] = None,
     use_aux: bool = False,
     apply_context_adjustment: bool = False,
+    use_log_target: bool = False,
 ) -> Tuple[float, float, Dict[str, float]]:
-    """Validate with optional post-processing and auxiliary metrics."""
+    """Validate with optional post-processing and auxiliary metrics.
+    
+    Args:
+        use_log_target: If True, apply expm1 to predictions before computing metrics
+                       (inverse of log1p applied during training)
+    """
     model.eval()
     losses = AverageMeter()
     
@@ -305,12 +321,19 @@ def validate(
     all_preds = torch.cat(all_preds, dim=0).numpy()
     all_targets = torch.cat(all_targets, dim=0).numpy()
     
+    # Apply inverse transform if using log targets
+    if use_log_target:
+        all_preds = np.expm1(all_preds)
+        all_targets = np.expm1(all_targets)
+    
     # Compute metrics for raw predictions
     r2_raw = compute_weighted_r2(all_preds, all_targets, target_weights)
     
     # Compute metrics for post-processed predictions
     if postprocessor is not None and all_preds_post:
         all_preds_post = torch.cat(all_preds_post, dim=0).numpy()
+        if use_log_target:
+            all_preds_post = np.expm1(all_preds_post)
         r2_post = compute_weighted_r2(all_preds_post, all_targets, target_weights)
     else:
         r2_post = r2_raw
@@ -319,6 +342,8 @@ def validate(
     # Compute metrics for context-adjusted predictions
     if all_preds_ctx:
         all_preds_ctx = torch.cat(all_preds_ctx, dim=0).numpy()
+        if use_log_target:
+            all_preds_ctx = np.expm1(all_preds_ctx)
         r2_ctx = compute_weighted_r2(all_preds_ctx, all_targets, target_weights)
     else:
         r2_ctx = r2_raw
@@ -368,13 +393,23 @@ def get_optimizer(
     weight_decay: float,
     device_type: DeviceType,
     stage: int = 2,
+    loss_fn: Optional[nn.Module] = None,
 ) -> AdamW:
-    """Create optimizer with differential LR for backbone vs heads."""
+    """Create optimizer with differential LR for backbone vs heads.
+    
+    Also includes learnable loss parameters (e.g., UncertaintyWeightedLoss.log_vars).
+    """
     use_fused = supports_fused_optimizer(device_type)
     
+    # Collect loss function parameters if it has any
+    loss_params = []
+    if loss_fn is not None:
+        loss_params = [p for p in loss_fn.parameters() if p.requires_grad]
+    
     if stage == 1:
-        # Stage 1: Only head parameters (backbone frozen)
+        # Stage 1: Only head parameters (backbone frozen) + loss params
         params = [p for p in model.parameters() if p.requires_grad]
+        params.extend(loss_params)
         return AdamW(params, lr=lr, weight_decay=weight_decay, fused=use_fused)
     else:
         # Stage 2: Differential LR
@@ -393,6 +428,11 @@ def get_optimizer(
             {"params": backbone_params, "lr": backbone_lr},
             {"params": head_params, "lr": lr},
         ]
+        
+        # Add loss params to head group (same LR as heads)
+        if loss_params:
+            param_groups.append({"params": loss_params, "lr": lr})
+        
         return AdamW(param_groups, weight_decay=weight_decay, fused=use_fused)
 
 
@@ -450,7 +490,35 @@ def train_fold(
     print(f"{'='*60}")
     
     # Datasets
-    train_transform = get_train_transforms(cfg.img_size, cfg.aug_prob)
+    use_log_target = getattr(cfg, "use_log_target", False)
+    stereo_correct_aug = getattr(cfg, "stereo_correct_aug", False)
+    stereo_swap_prob = getattr(cfg, "stereo_swap_prob", 0.0)
+    mixup_prob = getattr(cfg, "mixup_prob", 0.0)
+    mixup_alpha = getattr(cfg, "mixup_alpha", 0.4)
+    cutmix_prob = getattr(cfg, "cutmix_prob", 0.0)
+    cutmix_alpha = getattr(cfg, "cutmix_alpha", 1.0)
+    
+    if stereo_correct_aug:
+        # Stereo-correct: geometric transforms via replay, photometric independently
+        train_transform = get_stereo_geometric_transforms(cfg.img_size, cfg.aug_prob)
+        photometric_transform = get_stereo_photometric_transforms(cfg.aug_prob)
+        print(f"STEREO-CORRECT AUG: photometric transforms applied independently per view")
+    else:
+        train_transform = get_train_transforms(cfg.img_size, cfg.aug_prob)
+        photometric_transform = None
+    
+    if stereo_swap_prob > 0:
+        print(f"STEREO SWAP: L/R swap probability = {stereo_swap_prob:.1%}")
+    
+    if use_log_target:
+        print(f"LOG TARGET: Using log1p transformation on targets")
+    
+    if mixup_prob > 0:
+        print(f"MIXUP: prob={mixup_prob:.1%}, alpha={mixup_alpha} (same species/month/state only)")
+    
+    if cutmix_prob > 0:
+        print(f"CUTMIX: prob={cutmix_prob:.1%}, alpha={cutmix_alpha} (same species/month/state only)")
+    
     valid_transform = get_valid_transforms(cfg.img_size)
     
     # When caching images, must use num_workers=0 to avoid memory explosion
@@ -461,11 +529,16 @@ def train_fold(
     
     train_ds = BiomassDataset(
         train_df, cfg.train_image_dir, train_transform, 
-        is_train=True, cache_images=cfg.cache_images, return_aux_labels=use_aux_heads
+        is_train=True, cache_images=cfg.cache_images, return_aux_labels=use_aux_heads,
+        use_log_target=use_log_target, stereo_swap_prob=stereo_swap_prob,
+        photometric_transform=photometric_transform,
+        mixup_prob=mixup_prob, mixup_alpha=mixup_alpha,
+        cutmix_prob=cutmix_prob, cutmix_alpha=cutmix_alpha,
     )
     valid_ds = BiomassDataset(
         valid_df, cfg.train_image_dir, valid_transform, 
-        is_train=False, cache_images=cfg.cache_images, return_aux_labels=use_aux_heads
+        is_train=False, cache_images=cfg.cache_images, return_aux_labels=use_aux_heads,
+        use_log_target=use_log_target,  # Also apply log for validation targets
     )
     
     pin_memory = device_type == DeviceType.CUDA
@@ -546,6 +619,21 @@ def train_fold(
             aux_dead_weight=0.2,
         )
         print("Using DeadAwareLoss (log-space + auxiliary Dead loss)")
+    elif getattr(cfg, "use_uncertainty_loss", False):
+        # Learnable uncertainty weights (Kendall et al. 2018)
+        base_loss_fn = UncertaintyWeightedLoss(
+            n_targets=5,
+            use_huber_for_dead=getattr(cfg, "use_huber_for_dead", True),
+        )
+        print("Using UncertaintyWeightedLoss (learnable per-target weights)")
+    elif getattr(cfg, "use_balanced_loss", False):
+        # Balance penalty for per-target losses
+        base_loss_fn = BalancedMSELoss(
+            target_weights=target_weights,
+            balance_weight=getattr(cfg, "balance_weight", 0.1),
+            use_huber_for_dead=getattr(cfg, "use_huber_for_dead", True),
+        )
+        print(f"Using BalancedMSELoss (balance_weight={cfg.balance_weight})")
     elif getattr(cfg, "use_focal_loss", False):
         base_loss_fn = FocalMSELoss(target_weights=target_weights, gamma=1.0)
     else:
@@ -566,6 +654,14 @@ def train_fold(
         print(f"Using AuxiliaryLoss: state={cfg.aux_state_weight}, month={cfg.aux_month_weight}, species={getattr(cfg, 'aux_species_weight', 2.0)}")
     else:
         loss_fn = base_loss_fn
+    
+    # Add loss function's learnable parameters to optimizer (e.g., UncertaintyWeightedLoss)
+    loss_params = [p for p in loss_fn.parameters() if p.requires_grad]
+    if loss_params:
+        # Get current LR from optimizer
+        current_lr = optimizer.param_groups[-1]["lr"]
+        optimizer.add_param_group({"params": loss_params, "lr": current_lr})
+        print(f"Added {len(loss_params)} learnable loss parameters to optimizer")
     
     # Post-processor for validation
     postprocessor = DeadPostProcessor(
@@ -615,6 +711,7 @@ def train_fold(
             model, valid_loader, loss_fn, device, device_type, postprocessor,
             use_aux=use_aux_heads,
             apply_context_adjustment=apply_ctx and use_aux_heads,
+            use_log_target=use_log_target,
         )
         
         scheduler.step()
@@ -627,13 +724,14 @@ def train_fold(
         r2_vec = [metrics.get(f"r2_{n}", 0.0) for n in ["green", "dead", "clover", "gdm", "total"]]
         
         r2_ctx = metrics.get('r2_ctx', metrics['r2_raw'])
+        # Note: Loss is in log-space when use_log_target=True, R² is always on original scale (competition metric)
+        loss_suffix = " (log)" if use_log_target else ""
         print(
             f"Epoch {epoch:02d} {stage_str:>3} | "
-            f"Train: {train_loss:.4f} | "
-            f"Valid: {valid_loss:.4f} | "
-            f"R² raw: {metrics['r2_raw']:.4f} | "
-            f"R² post: {metrics['r2_post']:.4f} | "
-            f"R² ctx: {r2_ctx:.4f} | "
+            f"Train{loss_suffix}: {train_loss:.4f} | "
+            f"Valid{loss_suffix}: {valid_loss:.4f} | "
+            f"Comp.R²: {metrics['r2_post']:.4f} | "
+            f"R²_ctx: {r2_ctx:.4f} | "
             f"LR: {lr:.2e} | "
             f"Time: {elapsed:.1f}s"
         )
@@ -674,7 +772,7 @@ def train_fold(
             
             save_path = os.path.join(cfg.output_dir, f"5head_best_fold{fold}.pth")
             torch.save(model.state_dict(), save_path)
-            print(f"  -> Saved best model (R²: {best_r2:.4f})")
+            print(f"  -> Saved best model (Competition R²: {best_r2:.4f})")
         elif save_ok:
             patience_counter += 1
         
@@ -730,7 +828,7 @@ def main() -> None:
     parser.add_argument("--cache-images", action="store_true", help="Cache images in RAM for faster training")
     parser.add_argument("--prefetch-factor", type=int, default=4, help="DataLoader prefetch factor")
     parser.add_argument("--grad-accum", type=int, default=1, help="Gradient accumulation steps")
-    parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient clipping norm")
+    parser.add_argument("--grad-clip", type=float, default=0.5, help="Gradient clipping norm")
     parser.add_argument("--patience", type=int, default=10)
     
     # Learning rates
@@ -749,11 +847,11 @@ def main() -> None:
     # Auxiliary heads for multi-task learning
     parser.add_argument("--use-aux-heads", action="store_true",
                         help="Add auxiliary heads for State, Month, and Species classification")
-    parser.add_argument("--aux-state-weight", type=float, default=5.0,
+    parser.add_argument("--aux-state-weight", type=float, default=0.5,
                         help="Weight for state classification loss")
-    parser.add_argument("--aux-month-weight", type=float, default=3.0,
+    parser.add_argument("--aux-month-weight", type=float, default=0.5,
                         help="Weight for month classification loss")
-    parser.add_argument("--aux-species-weight", type=float, default=2.0,
+    parser.add_argument("--aux-species-weight", type=float, default=0.25,
                         help="Weight for species classification loss")
     parser.add_argument("--apply-context-adjustment", action="store_true",
                         help="Use predicted state/month/species to adjust predictions at inference")
@@ -764,6 +862,12 @@ def main() -> None:
     parser.add_argument("--use-focal-loss", action="store_true", help="Use focal MSE loss")
     parser.add_argument("--use-dead-aware-loss", action="store_true", 
                         help="Use DeadAwareLoss with log-space and auxiliary loss for Dead")
+    parser.add_argument("--use-uncertainty-loss", action="store_true",
+                        help="Use learnable uncertainty weights to balance per-target losses (Kendall et al.)")
+    parser.add_argument("--use-balanced-loss", action="store_true",
+                        help="Add variance penalty to balance per-target losses")
+    parser.add_argument("--balance-weight", type=float, default=0.1,
+                        help="Weight for balance penalty in BalancedMSELoss")
     parser.add_argument("--no-huber-for-dead", action="store_true", help="Disable Huber loss for dead target")
     parser.add_argument("--target-weights", type=float, nargs=5, 
                         default=[0.2, 0.2, 0.2, 0.2, 0.2],
@@ -776,6 +880,24 @@ def main() -> None:
     # Augmentation
     parser.add_argument("--img-size", type=int, default=518)
     parser.add_argument("--aug-prob", type=float, default=0.5)
+    parser.add_argument("--stereo-correct-aug", action="store_true",
+                        help="Apply photometric transforms independently per stereo view")
+    parser.add_argument("--stereo-swap-prob", type=float, default=0.0,
+                        help="Probability of swapping L/R stereo images (0.0-1.0, recommended: 0.5)")
+    
+    # Target normalization
+    parser.add_argument("--use-log-target", action="store_true",
+                        help="Apply log1p to targets (for long-tail distributions)")
+    
+    # MixUp/CutMix (constrained to same species/month/state)
+    parser.add_argument("--mixup-prob", type=float, default=0.0,
+                        help="MixUp probability (0.0-1.0, only mixes same species/month/state)")
+    parser.add_argument("--mixup-alpha", type=float, default=0.4,
+                        help="MixUp beta distribution alpha parameter")
+    parser.add_argument("--cutmix-prob", type=float, default=0.0,
+                        help="CutMix probability (0.0-1.0, only mixes same species/month/state)")
+    parser.add_argument("--cutmix-alpha", type=float, default=1.0,
+                        help="CutMix beta distribution alpha parameter")
     
     # AMP
     parser.add_argument("--amp-dtype", type=str, default="float16", choices=["float16", "bfloat16"])
@@ -783,7 +905,8 @@ def main() -> None:
     # CV
     parser.add_argument("--num-folds", type=int, default=5)
     parser.add_argument("--train-folds", type=int, nargs="+", default=[0, 1, 2, 3, 4])
-    parser.add_argument("--cv-strategy", type=str, default="group_month")
+    parser.add_argument("--cv-strategy", type=str, default="group_date_state",
+                        help="CV strategy: group_date_state (default), group_month, group_date, stratified, random")
     
     # Device
     parser.add_argument("--device-type", type=str, default=None, choices=["cuda", "mps", "cpu"])
@@ -837,6 +960,16 @@ def main() -> None:
         print(f"Auxiliary heads: State (weight={args.aux_state_weight}), Month (weight={args.aux_month_weight})")
         if args.apply_context_adjustment:
             print(f"Context adjustment: ENABLED (predictions adjusted based on predicted state/month)")
+    if args.use_log_target:
+        print(f"Log target: ENABLED (log1p on targets, expm1 on predictions)")
+    if args.stereo_correct_aug:
+        print(f"Stereo-correct aug: ENABLED (photometric transforms independent per view)")
+    if args.stereo_swap_prob > 0:
+        print(f"Stereo swap prob: {args.stereo_swap_prob:.1%}")
+    if args.mixup_prob > 0:
+        print(f"MixUp: prob={args.mixup_prob:.1%}, alpha={args.mixup_alpha} (same species/month/state)")
+    if args.cutmix_prob > 0:
+        print(f"CutMix: prob={args.cutmix_prob:.1%}, alpha={args.cutmix_alpha} (same species/month/state)")
     print(f"Output: {args.output_dir}")
     print("=" * 60)
     
@@ -864,19 +997,29 @@ def main() -> None:
     
     # Summary
     print("\n" + "=" * 60)
-    print("Training Summary")
+    print("Training Summary (Competition Weighted R²)")
     print("=" * 60)
+    print("Weights: Green=0.1, Dead=0.1, Clover=0.1, GDM=0.2, Total=0.5")
+    print("-" * 60)
     
     r2_scores = [r["best_r2"] for r in results]
     loss_scores = [r["best_loss"] for r in results]
     
     for r in results:
         metrics = r.get("best_metrics", {})
-        dead_r2 = metrics.get("r2_dead", 0)
-        print(f"Fold {r['fold']}: R² = {r['best_r2']:.4f}, Loss = {r['best_loss']:.4f}, Dead R² = {dead_r2:.4f}")
+        # Show per-target R² breakdown
+        r2_g = metrics.get("r2_green", 0)
+        r2_d = metrics.get("r2_dead", 0)
+        r2_c = metrics.get("r2_clover", 0)
+        r2_gdm = metrics.get("r2_gdm", 0)
+        r2_t = metrics.get("r2_total", 0)
+        print(f"Fold {r['fold']}: Comp.R²={r['best_r2']:.4f} | "
+              f"G={r2_g:.3f}, D={r2_d:.3f}, C={r2_c:.3f}, GDM={r2_gdm:.3f}, T={r2_t:.3f}")
     
-    print(f"\nCV Mean R²: {np.mean(r2_scores):.4f} ± {np.std(r2_scores):.4f}")
+    print("-" * 60)
+    print(f"CV Mean Comp.R²: {np.mean(r2_scores):.4f} ± {np.std(r2_scores):.4f}")
     print(f"CV Mean Loss: {np.mean(loss_scores):.4f} ± {np.std(loss_scores):.4f}")
+    print("\nNOTE: Run eval_5head_oof.py for true OOF R² (may be ~0.05-0.10 lower)")
     
     # Save results
     results_summary = {
@@ -902,6 +1045,14 @@ def main() -> None:
             "always_correct_dead": args.always_correct_dead,
             "cv_strategy": args.cv_strategy,
             "seed": args.seed,
+            # New augmentation / target normalization settings
+            "use_log_target": args.use_log_target,
+            "stereo_correct_aug": args.stereo_correct_aug,
+            "stereo_swap_prob": args.stereo_swap_prob,
+            "mixup_prob": args.mixup_prob,
+            "mixup_alpha": args.mixup_alpha,
+            "cutmix_prob": args.cutmix_prob,
+            "cutmix_alpha": args.cutmix_alpha,
         },
         "fold_results": [
             {
