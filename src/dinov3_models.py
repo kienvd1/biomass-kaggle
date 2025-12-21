@@ -864,7 +864,6 @@ class DepthGuidedAttention(nn.Module):
         
         # Lazy load depth model
         self._depth_model = None
-        self._depth_processor = None
         self._model_size = model_size
         
         # Learn how to combine depth with attention
@@ -889,9 +888,8 @@ class DepthGuidedAttention(nn.Module):
     def _ensure_model_loaded(self, device: torch.device) -> None:
         """Lazy load the depth model."""
         if self._depth_model is None:
-            from transformers import AutoModelForDepthEstimation, AutoImageProcessor
+            from transformers import AutoModelForDepthEstimation
             model_name = f"depth-anything/Depth-Anything-V2-{self._model_size.capitalize()}-hf"
-            self._depth_processor = AutoImageProcessor.from_pretrained(model_name)
             self._depth_model = AutoModelForDepthEstimation.from_pretrained(model_name)
             self._depth_model.to(device)
             self._depth_model.eval()
@@ -900,31 +898,30 @@ class DepthGuidedAttention(nn.Module):
     
     @torch.no_grad()
     def _get_depth_map(self, img: torch.Tensor) -> torch.Tensor:
-        """Get depth map from normalized image."""
-        self._ensure_model_loaded(img.device)
+        """Get depth map from normalized image - fully on GPU."""
+        device = img.device
+        self._ensure_model_loaded(device)
         
         B, C, H, W = img.shape
         
-        # De-normalize from ImageNet
-        mean = torch.tensor([0.485, 0.456, 0.406], device=img.device).view(1, 3, 1, 1)
-        std = torch.tensor([0.229, 0.224, 0.225], device=img.device).view(1, 3, 1, 1)
+        # De-normalize from ImageNet to [0, 1]
+        mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
         img_denorm = (img * std + mean).clamp(0, 1)
         
-        # Process for depth model (expects 0-255 range)
-        img_255 = (img_denorm * 255).to(torch.uint8)
+        # DA2 expects 518x518 input
+        img_resized = F.interpolate(img_denorm, size=(518, 518), mode="bilinear", align_corners=False)
         
-        # Use processor
-        inputs = self._depth_processor(
-            images=[x.permute(1, 2, 0).cpu().numpy() for x in img_255],
-            return_tensors="pt"
-        )
-        inputs = {k: v.to(img.device) for k, v in inputs.items()}
+        # Apply DA2 normalization directly on GPU (same as ImageNet)
+        da2_mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+        da2_std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+        img_normalized = (img_resized - da2_mean) / da2_std
         
-        # Get depth
-        outputs = self._depth_model(**inputs)
-        depth = outputs.predicted_depth
+        # Get depth directly on GPU
+        outputs = self._depth_model(pixel_values=img_normalized)
+        depth = outputs.predicted_depth  # (B, h, w)
         
-        # Resize back
+        # Resize back to original
         depth = F.interpolate(
             depth.unsqueeze(1), size=(H, W), mode="bilinear", align_corners=False
         ).squeeze(1)

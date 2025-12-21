@@ -886,6 +886,8 @@ def main() -> None:
     
     # Architecture
     parser.add_argument("--grid", type=int, default=2)
+    parser.add_argument("--img-size", type=int, default=None,
+                        help="Image size (default: 672 for DINOv3, 518 for DINOv2). Must be divisible by 16.")
     parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument("--hidden-ratio", type=float, default=0.25)
     parser.add_argument("--backbone-size", type=str, default="base",
@@ -1075,13 +1077,21 @@ def main() -> None:
     
     # Backbone info and image size
     backbone_type = getattr(args, 'backbone_type', 'dinov3')
-    if backbone_type == "dinov2":
+    if args.img_size is not None:
+        img_size = args.img_size  # User-specified
+    elif backbone_type == "dinov2":
         img_size = IMG_SIZE_DINOV2  # 518px native for DINOv2
+    else:
+        img_size = IMG_SIZE_DINOV3  # 672px for DINOv3
+    
+    # Store computed img_size back to args for config saving
+    args.img_size = img_size
+    
+    if backbone_type == "dinov2":
         print(f"Backbone: DINOv2-{args.backbone_size.upper()} (PlantCLEF pretrained)")
         if args.ckpt_path:
             print(f"  Weights: {args.ckpt_path}")
     else:
-        img_size = IMG_SIZE_DINOV3  # 672px for DINOv3
         print(f"Backbone: DINOv3-{args.backbone_size.upper()}")
     
     print(f"Image size: {img_size}")
