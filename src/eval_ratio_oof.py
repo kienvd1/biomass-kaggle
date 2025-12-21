@@ -3,8 +3,13 @@
 OOF Evaluation script for Ratio Model.
 
 Usage:
+    # DINOv2 models
     python -m src.eval_ratio_oof --model-dir ./outputs/ratio_XXXX --device mps
     python -m src.eval_ratio_oof --model-dir ./outputs/ratio_XXXX --tta --device cuda
+    
+    # DINOv3 models (use matching img-size)
+    python -m src.eval_ratio_oof --model-dir ./outputs/ratio_XXXX --model-type direct --img-size 992 --device mps
+    python -m src.eval_ratio_oof --model-dir ./outputs/ratio_XXXX --model-type direct --img-size 992 --tta --device mps
 """
 import argparse
 import json
@@ -110,6 +115,9 @@ def load_model(
     hidden_ratio: float = 0.5,
     use_film: bool = True,
     use_attention_pool: bool = True,
+    use_vegetation_indices: bool = False,
+    use_multiscale: bool = False,
+    multiscale_layers: Optional[List[int]] = None,
 ) -> nn.Module:
     """Load trained model from checkpoint."""
     model = build_ratio_model(
@@ -121,6 +129,9 @@ def load_model(
         use_film=use_film,
         use_attention_pool=use_attention_pool,
         model_type=model_type,
+        use_vegetation_indices=use_vegetation_indices,
+        use_multiscale=use_multiscale,
+        multiscale_layers=multiscale_layers,
     )
     
     state_dict = torch.load(checkpoint_path, map_location=device, weights_only=True)
@@ -269,12 +280,13 @@ def main() -> None:
     parser.add_argument("--model-dir", type=str, required=True, help="Path to model directory")
     parser.add_argument("--data-dir", type=str, default="./data", help="Path to data directory")
     parser.add_argument("--backbone", type=str, default=None, help="Backbone name (auto-detect if not specified)")
-    parser.add_argument("--model-type", type=str, default="softmax", choices=["softmax", "hierarchical"])
+    parser.add_argument("--model-type", type=str, default="softmax", choices=["softmax", "hierarchical", "direct"])
     parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "mps", "cpu"])
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--tta", action="store_true", help="Use TTA")
-    parser.add_argument("--img-size", type=int, default=518)
+    parser.add_argument("--img-size", type=int, default=518,
+                        help="Image size (518 for DINOv2, 512 or 992 for DINOv3)")
     
     args = parser.parse_args()
     
@@ -288,19 +300,27 @@ def main() -> None:
         cfg = config.get("config", {})
         backbone = args.backbone or cfg.get("backbone", "vit_base_patch14_reg4_dinov2.lvd142m")
         model_type = cfg.get("model_type", args.model_type)
+        img_size = cfg.get("img_size", args.img_size)
         grid = tuple(cfg.get("grid", [2, 2]))
         dropout = cfg.get("dropout", 0.2)
         hidden_ratio = cfg.get("hidden_ratio", 0.5)
         use_film = cfg.get("use_film", True)
         use_attention_pool = cfg.get("use_attention_pool", True)
+        use_vegetation_indices = cfg.get("use_vegetation_indices", False)
+        use_multiscale = cfg.get("use_multiscale", False)
+        multiscale_layers = cfg.get("multiscale_layers", None)
     else:
         backbone = args.backbone or "vit_base_patch14_reg4_dinov2.lvd142m"
         model_type = args.model_type
+        img_size = args.img_size
         grid = (2, 2)
         dropout = 0.2
         hidden_ratio = 0.5
         use_film = True
         use_attention_pool = True
+        use_vegetation_indices = False
+        use_multiscale = False
+        multiscale_layers = None
     
     print("=" * 60)
     print("OOF Evaluation for Ratio Model")
@@ -311,7 +331,9 @@ def main() -> None:
     print(f"Model type: {model_type}")
     print(f"Device: {device}")
     print(f"TTA: {args.tta}")
-    print(f"Image size: {args.img_size}")
+    print(f"Image size: {img_size}")
+    print(f"Vegetation Indices: {use_vegetation_indices}")
+    print(f"Multi-Scale: {use_multiscale}")
     print("=" * 60)
     
     # Load folds
@@ -354,8 +376,11 @@ def main() -> None:
             hidden_ratio=hidden_ratio,
             use_film=use_film,
             use_attention_pool=use_attention_pool,
+            use_vegetation_indices=use_vegetation_indices,
+            use_multiscale=use_multiscale,
+            multiscale_layers=multiscale_layers,
         )
-        print(f"  Model: FiLM={use_film}, AttnPool={use_attention_pool}")
+        print(f"  Model: FiLM={use_film}, AttnPool={use_attention_pool}, VI={use_vegetation_indices}, MultiScale={use_multiscale}")
         
         # Get validation indices
         val_mask = df["fold"] == fold
@@ -365,14 +390,14 @@ def main() -> None:
         
         # Predict
         if args.tta:
-            transforms = get_tta_transforms(args.img_size)
+            transforms = get_tta_transforms(img_size)
             preds, targets, ratios = predict_fold_tta(
                 model, val_df, image_dir, transforms, device,
                 batch_size=args.batch_size, num_workers=args.num_workers,
                 desc=f"Fold {fold}",
             )
         else:
-            transform = get_val_transform(args.img_size)
+            transform = get_val_transform(img_size)
             ds = OOFDataset(val_df, image_dir, transform)
             loader = DataLoader(
                 ds, batch_size=args.batch_size, shuffle=False,

@@ -61,6 +61,219 @@ class AttentionPooling(nn.Module):
         return out
 
 
+# =============================================================================
+# Vegetation Indices - Domain-specific features for biomass prediction
+# =============================================================================
+
+class VegetationIndices(nn.Module):
+    """
+    Compute vegetation indices from RGB images.
+    
+    Based on agricultural remote sensing research:
+    - Woebbecke et al. (1995) - ExG, ExR for crop/weed discrimination
+    - Gitelson et al. (2002) - VARI for vegetation fraction estimation
+    
+    Key insight: Chlorophyll absorbs red/blue, reflects green.
+    - Green plants → high ExG, high GRVI
+    - Dead plants → low/negative ExG, high ExR
+    """
+    
+    def forward(self, img: torch.Tensor) -> torch.Tensor:
+        """
+        Compute 6 vegetation indices from RGB image.
+        
+        Args:
+            img: (B, 3, H, W) RGB image normalized to [0, 1]
+        Returns:
+            indices: (B, 6, H, W) vegetation indices
+        """
+        r, g, b = img.unbind(dim=1)
+        
+        # Green biomass indicators
+        exg = 2 * g - r - b                          # Excess Green
+        grvi = (g - r) / (g + r + 1e-6)              # Green-Red Vegetation Index
+        vari = (g - r) / (g + r - b + 1e-6)          # Visible Atmospherically Resistant
+        
+        # Dead biomass indicators  
+        exr = 1.4 * r - g                            # Excess Red
+        exgr = exg - exr                             # Green minus Red excess
+        
+        # General
+        norm_g = g / (r + g + b + 1e-6)              # Normalized Green
+        
+        return torch.stack([exg, exr, exgr, grvi, norm_g, vari], dim=1)
+
+
+class VegetationFeaturesPooled(nn.Module):
+    """
+    Extract pooled vegetation index statistics as compact features.
+    
+    Computes mean and std of each vegetation index across the image,
+    providing a 12-dimensional feature vector per image.
+    """
+    
+    # ImageNet normalization constants
+    IMAGENET_MEAN = [0.485, 0.456, 0.406]
+    IMAGENET_STD = [0.229, 0.224, 0.225]
+    
+    def __init__(self) -> None:
+        super().__init__()
+        self.vi = VegetationIndices()
+        # Register as buffers so they move with the model
+        self.register_buffer(
+            "_mean", 
+            torch.tensor(self.IMAGENET_MEAN).view(1, 3, 1, 1)
+        )
+        self.register_buffer(
+            "_std",
+            torch.tensor(self.IMAGENET_STD).view(1, 3, 1, 1)
+        )
+    
+    @property
+    def out_features(self) -> int:
+        """Number of output features: 6 indices × 2 stats (mean, std)."""
+        return 12
+    
+    def forward(self, img: torch.Tensor) -> torch.Tensor:
+        """
+        Extract pooled VI features from ImageNet-normalized image.
+        
+        Args:
+            img: (B, 3, H, W) ImageNet-normalized image
+        Returns:
+            features: (B, 12) pooled vegetation features
+        """
+        # Denormalize from ImageNet stats to [0, 1]
+        img_denorm = (img * self._std + self._mean).clamp(0, 1)
+        
+        # Compute vegetation indices: (B, 6, H, W)
+        vi = self.vi(img_denorm)
+        
+        # Pool statistics: mean and std for each index
+        vi_flat = vi.flatten(2)  # (B, 6, H*W)
+        means = vi_flat.mean(dim=2)  # (B, 6)
+        stds = vi_flat.std(dim=2)    # (B, 6)
+        
+        return torch.cat([means, stds], dim=1)  # (B, 12)
+
+
+# =============================================================================
+# Multi-Scale Feature Extraction
+# =============================================================================
+
+class MultiScaleBackbone(nn.Module):
+    """
+    Extract features from multiple DINOv2/DINOv3 transformer blocks.
+    
+    DINOv2 ViT-B has 12 blocks (0-11). Extracting from multiple layers captures:
+    - Early layers (e.g., 5): texture, color, low-level patterns
+    - Middle layers (e.g., 8): mid-level patterns, shapes
+    - Late layers (e.g., 11): semantic content, high-level features
+    
+    For biomass prediction:
+    - Early layers → green vs brown color (chlorophyll)
+    - Middle layers → vegetation patterns (clover patches)
+    - Late layers → overall biomass density
+    """
+    
+    def __init__(
+        self,
+        backbone: nn.Module,
+        extract_layers: List[int] = [5, 8, 11],
+        pool_type: str = "cls",  # "cls" or "mean"
+    ) -> None:
+        super().__init__()
+        self.raw_backbone = backbone
+        self.extract_layers = sorted(extract_layers)
+        self.pool_type = pool_type
+        
+        # Get backbone properties
+        self.embed_dim = backbone.embed_dim
+        self.num_prefix_tokens = getattr(backbone, 'num_prefix_tokens', 1)
+        
+        num_scales = len(extract_layers)
+        
+        # Project each scale to smaller dim, then concat back to original size
+        # This keeps output dim = embed_dim for compatibility
+        scale_dim = self.embed_dim // num_scales
+        self.scale_projs = nn.ModuleList([
+            nn.Linear(self.embed_dim, scale_dim)
+            for _ in extract_layers
+        ])
+        
+        # Final projection to ensure output dim matches original backbone
+        self.out_proj = nn.Linear(scale_dim * num_scales, self.embed_dim)
+        
+        self._init_weights()
+    
+    def _init_weights(self) -> None:
+        for proj in self.scale_projs:
+            nn.init.xavier_uniform_(proj.weight, gain=0.1)
+            nn.init.zeros_(proj.bias)
+        nn.init.xavier_uniform_(self.out_proj.weight, gain=0.1)
+        nn.init.zeros_(self.out_proj.bias)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Extract multi-scale features from input image.
+        
+        Args:
+            x: (B, C, H, W) input image
+        Returns:
+            (B, embed_dim) multi-scale pooled features
+        """
+        backbone = self.raw_backbone
+        
+        # Patch embedding
+        x = backbone.patch_embed(x)
+        
+        # Position embedding - handle different DINOv2/v3 APIs
+        if hasattr(backbone, '_pos_embed'):
+            x = backbone._pos_embed(x)
+        elif hasattr(backbone, 'pos_embed') and backbone.pos_embed is not None:
+            x = x + backbone.pos_embed
+        
+        # Optional layers
+        if hasattr(backbone, 'patch_drop'):
+            x = backbone.patch_drop(x)
+        if hasattr(backbone, 'norm_pre'):
+            x = backbone.norm_pre(x)
+        
+        # Extract features from multiple blocks
+        features = []
+        for i, blk in enumerate(backbone.blocks):
+            x = blk(x)
+            
+            if i in self.extract_layers:
+                # Pool features
+                if self.pool_type == "cls" and self.num_prefix_tokens > 0:
+                    feat = x[:, 0]  # CLS token
+                else:
+                    # Mean pool over spatial tokens (skip prefix tokens)
+                    feat = x[:, self.num_prefix_tokens:].mean(dim=1)
+                features.append(feat)
+        
+        # Project each scale and concatenate
+        projected = [proj(f) for proj, f in zip(self.scale_projs, features)]
+        combined = torch.cat(projected, dim=-1)  # (B, scale_dim * num_scales)
+        
+        # Final projection to match original embed_dim
+        out = self.out_proj(combined)  # (B, embed_dim)
+        
+        return out
+
+
+def _wrap_backbone_multiscale(
+    backbone: nn.Module,
+    use_multiscale: bool,
+    multiscale_layers: List[int],
+) -> nn.Module:
+    """Optionally wrap backbone with multi-scale extraction."""
+    if use_multiscale:
+        return MultiScaleBackbone(backbone, extract_layers=multiscale_layers)
+    return backbone
+
+
 class SoftmaxRatioDINO(nn.Module):
     """
     Softmax Ratio Model: Predict Total + component ratios.
@@ -75,6 +288,8 @@ class SoftmaxRatioDINO(nn.Module):
     - Green + Dead + Clover = Total (always, by construction)
     - No negative predictions possible
     - Model learns proportions (bounded [0,1]) which may be easier than absolute values
+    
+    Optional: use_vegetation_indices adds domain-specific color features.
     """
     
     def __init__(
@@ -88,12 +303,23 @@ class SoftmaxRatioDINO(nn.Module):
         use_attention_pool: bool = True,
         gradient_checkpointing: bool = False,
         ratio_temperature: float = 1.0,
+        use_vegetation_indices: bool = False,
+        use_multiscale: bool = False,
+        multiscale_layers: Optional[List[int]] = None,
     ) -> None:
         super().__init__()
         
-        self.backbone, feat_dim, input_res = _build_dino_by_name(
+        raw_backbone, feat_dim, input_res = _build_dino_by_name(
             backbone_name, pretrained, gradient_checkpointing
         )
+        
+        # Optionally wrap with multi-scale extraction
+        self.use_multiscale = use_multiscale
+        self.multiscale_layers = multiscale_layers or [5, 8, 11]
+        self.backbone = _wrap_backbone_multiscale(
+            raw_backbone, use_multiscale, self.multiscale_layers
+        )
+        
         self.used_backbone_name = backbone_name
         self.input_res = int(input_res)
         self.feat_dim = feat_dim
@@ -101,6 +327,7 @@ class SoftmaxRatioDINO(nn.Module):
         self.use_film = use_film
         self.use_attention_pool = use_attention_pool
         self.ratio_temperature = ratio_temperature
+        self.use_vegetation_indices = use_vegetation_indices
         
         # FiLM for left-right stream conditioning
         if use_film:
@@ -112,9 +339,16 @@ class SoftmaxRatioDINO(nn.Module):
             self.attn_pool_left = AttentionPooling(feat_dim)
             self.attn_pool_right = AttentionPooling(feat_dim)
         
-        # Combined features from left + right streams
-        self.combined_dim = feat_dim * 2
-        hidden_dim = max(64, int(self.combined_dim * hidden_ratio))
+        # Vegetation indices: 12 features per view (6 indices × 2 stats)
+        if use_vegetation_indices:
+            self.vi_extractor = VegetationFeaturesPooled()
+            vi_dim = self.vi_extractor.out_features * 2  # × 2 for left + right
+        else:
+            vi_dim = 0
+        
+        # Combined features from left + right streams + VI
+        self.combined_dim = feat_dim * 2 + vi_dim
+        hidden_dim = max(64, int((feat_dim * 2) * hidden_ratio))
         self.hidden_dim = hidden_dim
         
         # Shared feature projection
@@ -240,8 +474,15 @@ class SoftmaxRatioDINO(nn.Module):
             f_l = tiles_left.mean(dim=1)
             f_r = tiles_right.mean(dim=1)
         
-        # Combine and project
+        # Combine backbone features
         f = torch.cat([f_l, f_r], dim=1)
+        
+        # Add vegetation index features if enabled
+        if self.use_vegetation_indices:
+            vi_left = self.vi_extractor(x_left)    # (B, 12)
+            vi_right = self.vi_extractor(x_right)  # (B, 12)
+            f = torch.cat([f, vi_left, vi_right], dim=1)
+        
         f = self.shared_proj(f)
         
         # Predict Total (absolute biomass)
@@ -282,6 +523,9 @@ class HierarchicalRatioDINO(nn.Module):
     - Clover = GDM - Green = GDM × (1 - green_ratio)
     
     All intermediate values are bounded [0, 1], making optimization easier.
+    
+    Optional: use_vegetation_indices adds domain-specific color features
+    that correlate with green/dead biomass (ExG, ExR, GRVI, etc.)
     """
     
     def __init__(
@@ -294,18 +538,30 @@ class HierarchicalRatioDINO(nn.Module):
         use_film: bool = True,
         use_attention_pool: bool = True,
         gradient_checkpointing: bool = False,
+        use_vegetation_indices: bool = False,
+        use_multiscale: bool = False,
+        multiscale_layers: Optional[List[int]] = None,
     ) -> None:
         super().__init__()
         
-        self.backbone, feat_dim, input_res = _build_dino_by_name(
+        raw_backbone, feat_dim, input_res = _build_dino_by_name(
             backbone_name, pretrained, gradient_checkpointing
         )
+        
+        # Optionally wrap with multi-scale extraction
+        self.use_multiscale = use_multiscale
+        self.multiscale_layers = multiscale_layers or [5, 8, 11]
+        self.backbone = _wrap_backbone_multiscale(
+            raw_backbone, use_multiscale, self.multiscale_layers
+        )
+        
         self.used_backbone_name = backbone_name
         self.input_res = int(input_res)
         self.feat_dim = feat_dim
         self.grid = tuple(grid)
         self.use_film = use_film
         self.use_attention_pool = use_attention_pool
+        self.use_vegetation_indices = use_vegetation_indices
         
         if use_film:
             self.film_left = FiLM(feat_dim)
@@ -315,8 +571,15 @@ class HierarchicalRatioDINO(nn.Module):
             self.attn_pool_left = AttentionPooling(feat_dim)
             self.attn_pool_right = AttentionPooling(feat_dim)
         
-        self.combined_dim = feat_dim * 2
-        hidden_dim = max(64, int(self.combined_dim * hidden_ratio))
+        # Vegetation indices: 12 features per view (6 indices × 2 stats)
+        if use_vegetation_indices:
+            self.vi_extractor = VegetationFeaturesPooled()
+            vi_dim = self.vi_extractor.out_features * 2  # × 2 for left + right
+        else:
+            vi_dim = 0
+        
+        self.combined_dim = feat_dim * 2 + vi_dim
+        hidden_dim = max(64, int((feat_dim * 2) * hidden_ratio))  # Base on backbone dim
         self.hidden_dim = hidden_dim
         
         self.shared_proj = nn.Sequential(
@@ -423,7 +686,15 @@ class HierarchicalRatioDINO(nn.Module):
             f_l = tiles_left.mean(dim=1)
             f_r = tiles_right.mean(dim=1)
         
+        # Combine backbone features
         f = torch.cat([f_l, f_r], dim=1)
+        
+        # Add vegetation index features if enabled
+        if self.use_vegetation_indices:
+            vi_left = self.vi_extractor(x_left)    # (B, 12)
+            vi_right = self.vi_extractor(x_right)  # (B, 12)
+            f = torch.cat([f, vi_left, vi_right], dim=1)
+        
         f = self.shared_proj(f)
         
         # Stage 1: Total biomass
@@ -443,6 +714,231 @@ class HierarchicalRatioDINO(nn.Module):
         
         if return_ratios:
             return green, dead, clover, gdm, total, alive_ratio, green_ratio
+        
+        return green, dead, clover, gdm, total
+
+
+class DirectDINO(nn.Module):
+    """
+    Direct Prediction Model: Predict Total, Green, GDM directly.
+    
+    Architecture:
+    - Predicts Total (strongest visual signal - total biomass)
+    - Predicts Green (easy to see - green color)
+    - Predicts GDM (Green Dry Matter = Green + Clover, easier than predicting clover)
+    
+    Then derive:
+    - Dead = Total - GDM (what's not alive)
+    - Clover = GDM - Green (alive but not green)
+    
+    Advantages:
+    - Predicts values with strong visual signals
+    - Clover (smallest, hardest) is derived, not predicted directly
+    - Dead is derived from easier predictions
+    - Still maintains consistency: Green + Dead + Clover = Total
+    
+    Constraints enforced:
+    - Total >= GDM >= Green >= 0 (via ReLU clamping)
+    
+    Optional: use_vegetation_indices adds domain-specific color features.
+    """
+    
+    def __init__(
+        self,
+        backbone_name: str = "vit_base_patch14_reg4_dinov2.lvd142m",
+        grid: Tuple[int, int] = (2, 2),
+        pretrained: bool = True,
+        dropout: float = 0.2,
+        hidden_ratio: float = 0.5,
+        use_film: bool = True,
+        use_attention_pool: bool = True,
+        gradient_checkpointing: bool = False,
+        use_vegetation_indices: bool = False,
+        use_multiscale: bool = False,
+        multiscale_layers: Optional[List[int]] = None,
+    ) -> None:
+        super().__init__()
+        
+        raw_backbone, feat_dim, input_res = _build_dino_by_name(
+            backbone_name, pretrained, gradient_checkpointing
+        )
+        
+        # Optionally wrap with multi-scale extraction
+        self.use_multiscale = use_multiscale
+        self.multiscale_layers = multiscale_layers or [5, 8, 11]
+        self.backbone = _wrap_backbone_multiscale(
+            raw_backbone, use_multiscale, self.multiscale_layers
+        )
+        
+        self.used_backbone_name = backbone_name
+        self.input_res = int(input_res)
+        self.feat_dim = feat_dim
+        self.grid = tuple(grid)
+        self.use_film = use_film
+        self.use_attention_pool = use_attention_pool
+        self.use_vegetation_indices = use_vegetation_indices
+        
+        if use_film:
+            self.film_left = FiLM(feat_dim)
+            self.film_right = FiLM(feat_dim)
+        
+        if use_attention_pool:
+            self.attn_pool_left = AttentionPooling(feat_dim)
+            self.attn_pool_right = AttentionPooling(feat_dim)
+        
+        # Vegetation indices: 12 features per view (6 indices × 2 stats)
+        if use_vegetation_indices:
+            self.vi_extractor = VegetationFeaturesPooled()
+            vi_dim = self.vi_extractor.out_features * 2  # × 2 for left + right
+        else:
+            vi_dim = 0
+        
+        self.combined_dim = feat_dim * 2 + vi_dim
+        hidden_dim = max(64, int((feat_dim * 2) * hidden_ratio))
+        self.hidden_dim = hidden_dim
+        
+        self.shared_proj = nn.Sequential(
+            nn.LayerNorm(self.combined_dim),
+            nn.Linear(self.combined_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        
+        def _make_head(in_dim: int, out_dim: int = 1) -> nn.Sequential:
+            return nn.Sequential(
+                nn.Linear(in_dim, in_dim),
+                nn.GELU(),
+                nn.Dropout(dropout * 0.5),
+                nn.Linear(in_dim, out_dim),
+            )
+        
+        # Predict Total, Green, GDM directly
+        self.head_total = _make_head(hidden_dim, 1)
+        self.head_green = _make_head(hidden_dim, 1)
+        self.head_gdm = _make_head(hidden_dim, 1)
+        
+        self.softplus = nn.Softplus(beta=1.0)
+        
+        self._init_heads()
+    
+    def _init_heads(self) -> None:
+        for head in [self.head_total, self.head_green, self.head_gdm]:
+            for m in head.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight, gain=0.1)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+    
+    def _collect_tiles(self, x: torch.Tensor) -> List[torch.Tensor]:
+        """Collect tiles from image."""
+        _, C, H, W = x.shape
+        r, c = self.grid
+        rows = _make_edges(H, r)
+        cols = _make_edges(W, c)
+
+        tiles = []
+        for rs, re in rows:
+            for cs, ce in cols:
+                xt = x[:, :, rs:re, cs:ce]
+                if xt.shape[-2:] != (self.input_res, self.input_res):
+                    xt = F.interpolate(
+                        xt,
+                        size=(self.input_res, self.input_res),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                tiles.append(xt)
+        return tiles
+
+    def _extract_tiles_fused(
+        self, x_left: torch.Tensor, x_right: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Extract tile features from BOTH streams in ONE backbone call."""
+        B = x_left.size(0)
+
+        tiles_left = self._collect_tiles(x_left)
+        tiles_right = self._collect_tiles(x_right)
+        num_tiles = len(tiles_left)
+
+        all_tiles = torch.cat(tiles_left + tiles_right, dim=0)
+        all_feats = self.backbone(all_tiles)
+
+        total_tiles = 2 * num_tiles
+        all_feats = all_feats.view(total_tiles, B, -1).permute(1, 0, 2)
+        feats_left = all_feats[:, :num_tiles, :]
+        feats_right = all_feats[:, num_tiles:, :]
+
+        return feats_left, feats_right
+    
+    def forward(
+        self,
+        x_left: torch.Tensor,
+        x_right: torch.Tensor,
+        return_ratios: bool = False,
+    ) -> Tuple[torch.Tensor, ...]:
+        """
+        Forward pass with direct prediction.
+        
+        Returns:
+            (green, dead, clover, gdm, total) - each (B, 1)
+        """
+        tiles_left, tiles_right = self._extract_tiles_fused(x_left, x_right)
+
+        ctx_left = tiles_left.mean(dim=1)
+        ctx_right = tiles_right.mean(dim=1)
+        
+        if self.use_film:
+            gamma_l, beta_l = self.film_left(ctx_right)
+            gamma_r, beta_r = self.film_right(ctx_left)
+            tiles_left = tiles_left * (1 + gamma_l.unsqueeze(1)) + beta_l.unsqueeze(1)
+            tiles_right = tiles_right * (1 + gamma_r.unsqueeze(1)) + beta_r.unsqueeze(1)
+        
+        if self.use_attention_pool:
+            f_l = self.attn_pool_left(tiles_left)
+            f_r = self.attn_pool_right(tiles_right)
+        else:
+            f_l = tiles_left.mean(dim=1)
+            f_r = tiles_right.mean(dim=1)
+        
+        # Combine backbone features
+        f = torch.cat([f_l, f_r], dim=1)
+        
+        # Add vegetation index features if enabled
+        if self.use_vegetation_indices:
+            vi_left = self.vi_extractor(x_left)    # (B, 12)
+            vi_right = self.vi_extractor(x_right)  # (B, 12)
+            f = torch.cat([f, vi_left, vi_right], dim=1)
+        
+        f = self.shared_proj(f)
+        
+        # Predict Total, Green, GDM directly (all positive via softplus)
+        total_raw = self.softplus(self.head_total(f))  # (B, 1)
+        green_raw = self.softplus(self.head_green(f))  # (B, 1)
+        gdm_raw = self.softplus(self.head_gdm(f))      # (B, 1)
+        
+        # Enforce constraints: Total >= GDM >= Green >= 0
+        # Use soft clamping to allow gradients
+        total = total_raw
+        gdm = torch.minimum(gdm_raw, total)        # GDM <= Total
+        green = torch.minimum(green_raw, gdm)      # Green <= GDM
+        
+        # Derive Dead and Clover
+        dead = total - gdm                          # Dead = Total - GDM
+        clover = gdm - green                        # Clover = GDM - Green
+        
+        # Ensure non-negative (numerical safety)
+        dead = F.relu(dead)
+        clover = F.relu(clover)
+        
+        if return_ratios:
+            # Return ratios for auxiliary loss
+            total_safe = total + 1e-8
+            ratios = torch.cat([
+                green / total_safe,
+                dead / total_safe,
+                clover / total_safe,
+            ], dim=1)  # (B, 3)
+            return green, dead, clover, gdm, total, ratios
         
         return green, dead, clover, gdm, total
 
@@ -555,12 +1051,21 @@ def build_ratio_model(
     gradient_checkpointing: bool = False,
     model_type: str = "softmax",
     ratio_temperature: float = 1.0,
+    use_vegetation_indices: bool = False,
+    use_multiscale: bool = False,
+    multiscale_layers: Optional[List[int]] = None,
 ) -> nn.Module:
     """
     Build ratio-based model.
     
     Args:
-        model_type: "softmax" for SoftmaxRatioDINO, "hierarchical" for HierarchicalRatioDINO
+        model_type: 
+            - "softmax": SoftmaxRatioDINO (predict Total + ratios)
+            - "hierarchical": HierarchicalRatioDINO (predict Total, alive_ratio, green_ratio)
+            - "direct": DirectDINO (predict Total, Green, GDM; derive Dead, Clover)
+        use_vegetation_indices: Add vegetation index features (ExG, ExR, GRVI, etc.)
+        use_multiscale: Extract features from multiple transformer layers
+        multiscale_layers: Which layers to extract (default [5, 8, 11] for ViT-B)
     """
     if model_type == "hierarchical":
         return HierarchicalRatioDINO(
@@ -572,6 +1077,23 @@ def build_ratio_model(
             use_film=use_film,
             use_attention_pool=use_attention_pool,
             gradient_checkpointing=gradient_checkpointing,
+            use_vegetation_indices=use_vegetation_indices,
+            use_multiscale=use_multiscale,
+            multiscale_layers=multiscale_layers,
+        )
+    elif model_type == "direct":
+        return DirectDINO(
+            backbone_name=backbone_name,
+            grid=grid,
+            pretrained=pretrained,
+            dropout=dropout,
+            hidden_ratio=hidden_ratio,
+            use_film=use_film,
+            use_attention_pool=use_attention_pool,
+            gradient_checkpointing=gradient_checkpointing,
+            use_vegetation_indices=use_vegetation_indices,
+            use_multiscale=use_multiscale,
+            multiscale_layers=multiscale_layers,
         )
     else:
         return SoftmaxRatioDINO(
@@ -584,4 +1106,7 @@ def build_ratio_model(
             use_attention_pool=use_attention_pool,
             gradient_checkpointing=gradient_checkpointing,
             ratio_temperature=ratio_temperature,
+            use_vegetation_indices=use_vegetation_indices,
+            use_multiscale=use_multiscale,
+            multiscale_layers=multiscale_layers,
         )

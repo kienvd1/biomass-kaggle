@@ -104,6 +104,7 @@ def train_one_epoch(
     grad_clip: float = 1.0,
     grad_accum_steps: int = 1,
     use_ratio_loss: bool = False,
+    disable_amp: bool = False,
 ) -> Tuple[float, Dict[str, float]]:
     """Train for one epoch with gradient scaling and clipping."""
     model.train()
@@ -114,6 +115,8 @@ def train_one_epoch(
     }
 
     use_amp, autocast_device, amp_dtype = get_amp_settings(device_type)
+    if disable_amp:
+        use_amp = False
 
     pbar = tqdm(loader, desc="Training", leave=False)
     optimizer.zero_grad(set_to_none=True)
@@ -191,12 +194,15 @@ def validate(
     device: torch.device,
     device_type: DeviceType,
     use_log_target: bool = False,
+    disable_amp: bool = False,
 ) -> Tuple[float, float, Dict[str, float]]:
     """Validate model."""
     model.eval()
     losses = AverageMeter()
     
     use_amp, autocast_device, amp_dtype = get_amp_settings(device_type)
+    if disable_amp:
+        use_amp = False
     target_weights = [0.1, 0.1, 0.1, 0.2, 0.5]  # Competition weights
     
     all_preds = []
@@ -445,6 +451,9 @@ def train_fold(
         gradient_checkpointing=getattr(cfg, "grad_ckpt", False),
         model_type=cfg.model_type,
         ratio_temperature=getattr(cfg, "ratio_temperature", 1.0),
+        use_vegetation_indices=getattr(cfg, "use_vegetation_indices", False),
+        use_multiscale=getattr(cfg, "use_multiscale", False),
+        multiscale_layers=getattr(cfg, "multiscale_layers", None),
     ).to(device)
 
     if device_type == DeviceType.MPS:
@@ -457,7 +466,8 @@ def train_fold(
         print(f"Using DataParallel with {num_gpus} GPUs")
 
     total_params = sum(p.numel() for p in model.parameters())
-    model_name = "HierarchicalRatioDINO" if cfg.model_type == "hierarchical" else "SoftmaxRatioDINO"
+    model_names = {"hierarchical": "HierarchicalRatioDINO", "direct": "DirectDINO", "softmax": "SoftmaxRatioDINO"}
+    model_name = model_names.get(cfg.model_type, cfg.model_type)
     print(f"Model: {model_name} ({cfg.backbone})")
     print(f"Grid: {cfg.grid}, FiLM: {getattr(cfg, 'use_film', True)}, AttnPool: {getattr(cfg, 'use_attention_pool', True)}")
     print(f"Total params: {total_params:,}")
@@ -532,12 +542,14 @@ def train_fold(
             grad_clip=cfg.grad_clip,
             grad_accum_steps=getattr(cfg, "grad_accum", 1),
             use_ratio_loss=cfg.ratio_loss_weight > 0,
+            disable_amp=getattr(cfg, "no_amp", False),
         )
         
         # Validate
         valid_loss, r2, metrics = validate(
             model, valid_loader, loss_fn, device, device_type,
             use_log_target=use_log_target,
+            disable_amp=getattr(cfg, "no_amp", False),
         )
         
         scheduler.step()
@@ -623,7 +635,11 @@ def main() -> None:
     # Model architecture
     parser.add_argument(
         "--backbone", type=str, default="vit_base_patch14_reg4_dinov2.lvd142m",
-        help="DINOv2 backbone"
+        help="Vision backbone. Options: "
+             "DINOv2: vit_base_patch14_reg4_dinov2.lvd142m (518x518), "
+             "vit_large_patch14_reg4_dinov2.lvd142m; "
+             "DINOv3: vit_base_patch16_dinov3 (256x256), "
+             "vit_large_patch16_dinov3, vit_huge_plus_patch16_dinov3"
     )
     parser.add_argument("--grid", type=int, nargs=2, default=[2, 2])
     parser.add_argument("--dropout", type=float, default=0.2)
@@ -631,10 +647,16 @@ def main() -> None:
     parser.add_argument("--no-film", action="store_true", help="Disable FiLM conditioning")
     parser.add_argument("--no-attention-pool", action="store_true", help="Disable attention pooling")
     parser.add_argument("--grad-ckpt", action="store_true", help="Enable gradient checkpointing")
+    parser.add_argument("--use-vegetation-indices", action="store_true",
+                        help="Add vegetation indices (ExG, ExR, GRVI, etc.) as auxiliary features")
+    parser.add_argument("--use-multiscale", action="store_true",
+                        help="Enable multi-scale feature extraction from multiple transformer layers")
+    parser.add_argument("--multiscale-layers", type=int, nargs="+", default=[5, 8, 11],
+                        help="Transformer layers to extract for multi-scale (default: 5 8 11)")
     
     # Model type
-    parser.add_argument("--model-type", type=str, default="softmax", choices=["softmax", "hierarchical"],
-                        help="Model type: 'softmax' for SoftmaxRatioDINO, 'hierarchical' for HierarchicalRatioDINO")
+    parser.add_argument("--model-type", type=str, default="softmax", choices=["softmax", "hierarchical", "direct"],
+                        help="Model type: 'softmax', 'hierarchical', or 'direct' (predict Total/Green/GDM, derive Dead/Clover)")
     parser.add_argument("--ratio-temperature", type=float, default=1.0,
                         help="Temperature for softmax ratio (only for softmax model)")
     
@@ -673,7 +695,9 @@ def main() -> None:
                         help="Ratio loss type: 'mse' or 'kl' (KL divergence)")
     
     # Augmentation
-    parser.add_argument("--img-size", type=int, default=518)
+    parser.add_argument("--img-size", type=int, default=518,
+                        help="Input image size. Use 518 for DINOv2, 512 for DINOv3 with 2x2 grid, "
+                             "256 for DINOv3 with 1x1 grid")
     parser.add_argument("--aug-prob", type=float, default=0.5)
     parser.add_argument("--stereo-correct-aug", action="store_true",
                         help="Apply photometric transforms independently per stereo view")
@@ -696,6 +720,8 @@ def main() -> None:
     
     # AMP
     parser.add_argument("--amp-dtype", type=str, default="float16", choices=["float16", "bfloat16"])
+    parser.add_argument("--no-amp", action="store_true", 
+                        help="Disable automatic mixed precision (fixes NaN with DINOv3 on MPS)")
     
     # CV
     parser.add_argument("--num-folds", type=int, default=5)
@@ -745,7 +771,7 @@ def main() -> None:
     print(f"Model type: {args.model_type}")
     print(f"Backbone: {args.backbone}")
     print(f"Grid: {args.grid}")
-    print(f"FiLM: {args.use_film}, AttnPool: {args.use_attention_pool}")
+    print(f"FiLM: {args.use_film}, AttnPool: {args.use_attention_pool}, VegIndices: {args.use_vegetation_indices}")
     print(f"Hidden ratio: {args.hidden_ratio}, Dropout: {args.dropout}")
     print(f"Epochs: {args.epochs}, Batch size: {args.batch_size}")
     if args.freeze_backbone:
@@ -836,6 +862,9 @@ def main() -> None:
                     model_type=args.model_type,
                     grid=tuple(args.grid), dropout=args.dropout, hidden_ratio=args.hidden_ratio,
                     use_film=args.use_film, use_attention_pool=args.use_attention_pool,
+                    use_vegetation_indices=args.use_vegetation_indices,
+                    use_multiscale=args.use_multiscale,
+                    multiscale_layers=args.multiscale_layers,
                 )
                 
                 # Get validation indices and predictions
@@ -906,11 +935,15 @@ def main() -> None:
         "config": {
             "backbone": args.backbone,
             "model_type": args.model_type,
+            "img_size": args.img_size,
             "grid": args.grid,
             "dropout": args.dropout,
             "hidden_ratio": args.hidden_ratio,
             "use_film": args.use_film,
             "use_attention_pool": args.use_attention_pool,
+            "use_vegetation_indices": args.use_vegetation_indices,
+            "use_multiscale": args.use_multiscale,
+            "multiscale_layers": args.multiscale_layers,
             "two_stage": args.two_stage,
             "freeze_epochs": args.freeze_epochs if args.two_stage else 0,
             "epochs": args.epochs,

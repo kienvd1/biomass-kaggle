@@ -62,6 +62,8 @@ class BiomassDataset(Dataset):
         use_log_target: bool = False,
         stereo_swap_prob: float = 0.0,
         photometric_transform: Optional[A.Compose] = None,
+        photometric_left_only: bool = False,
+        photometric_right_only: bool = False,
         mixup_prob: float = 0.0,
         mixup_alpha: float = 0.4,
         cutmix_prob: float = 0.0,
@@ -79,6 +81,8 @@ class BiomassDataset(Dataset):
             use_log_target: If True, apply log1p to targets (for long-tail distributions)
             stereo_swap_prob: Probability of swapping left/right images (0.0 to disable)
             photometric_transform: Separate photometric transforms applied independently per view
+            photometric_left_only: If True, only apply photometric to left view
+            photometric_right_only: If True, only apply photometric to right view
             mixup_prob: Probability of applying MixUp (0.0 to disable)
             mixup_alpha: Beta distribution alpha for MixUp lambda sampling
             cutmix_prob: Probability of applying CutMix (0.0 to disable)
@@ -94,6 +98,8 @@ class BiomassDataset(Dataset):
         self.use_log_target = use_log_target
         self.stereo_swap_prob = stereo_swap_prob
         self.photometric_transform = photometric_transform
+        self.photometric_left_only = photometric_left_only
+        self.photometric_right_only = photometric_right_only
         self.mixup_prob = mixup_prob
         self.mixup_alpha = mixup_alpha
         self.cutmix_prob = cutmix_prob
@@ -126,6 +132,18 @@ class BiomassDataset(Dataset):
                 self.species_labels = self.df["Species"].map(self.SPECIES_LABELS).fillna(7).values.astype(np.int64)
             else:
                 self.species_labels = np.zeros(len(self.df), dtype=np.int64)
+            
+            # Ground-truth NDVI (Pre_GSHH_NDVI) - range typically 0.16-0.91
+            if "Pre_GSHH_NDVI" in self.df.columns:
+                self.ndvi_values = self.df["Pre_GSHH_NDVI"].fillna(0.5).values.astype(np.float32)
+            else:
+                self.ndvi_values = np.full(len(self.df), 0.5, dtype=np.float32)
+            
+            # Average height in cm (Height_Ave_cm) - range typically 1-70 cm
+            if "Height_Ave_cm" in self.df.columns:
+                self.height_values = self.df["Height_Ave_cm"].fillna(10.0).values.astype(np.float32)
+            else:
+                self.height_values = np.full(len(self.df), 10.0, dtype=np.float32)
         
         # Build context index for constrained MixUp/CutMix (same species + month + state)
         self._context_index: Dict[Tuple[int, int, int], List[int]] = {}
@@ -294,15 +312,25 @@ class BiomassDataset(Dataset):
                 left_t = replay["image"]
                 right_t = self.transform.replay(replay["replay"], image=right)["image"]
                 
-                # Apply photometric transforms INDEPENDENTLY per view (stereo-correct)
+                # Apply photometric transforms (optionally independent per view)
                 if self.photometric_transform is not None:
                     # Convert back to numpy for photometric aug
                     left_np = left_t.permute(1, 2, 0).numpy()
                     right_np = right_t.permute(1, 2, 0).numpy()
                     
-                    # Apply independent photometric transforms
-                    left_t = self.photometric_transform(image=left_np)["image"]
-                    right_t = self.photometric_transform(image=right_np)["image"]
+                    # Apply photometric transforms based on mode
+                    if self.photometric_left_only:
+                        # Only apply to left
+                        left_t = self.photometric_transform(image=left_np)["image"]
+                        right_t = torch.from_numpy(right_np.transpose(2, 0, 1))
+                    elif self.photometric_right_only:
+                        # Only apply to right
+                        left_t = torch.from_numpy(left_np.transpose(2, 0, 1))
+                        right_t = self.photometric_transform(image=right_np)["image"]
+                    else:
+                        # Apply independently to both (default)
+                        left_t = self.photometric_transform(image=left_np)["image"]
+                        right_t = self.photometric_transform(image=right_np)["image"]
             else:
                 left_t = self.transform(image=left)["image"]
                 right_t = self.transform(image=right)["image"]
@@ -377,98 +405,228 @@ class BiomassDataset(Dataset):
             state_label = torch.tensor(self.state_labels[idx], dtype=torch.long)
             month_label = torch.tensor(self.month_labels[idx], dtype=torch.long)
             species_label = torch.tensor(self.species_labels[idx], dtype=torch.long)
-            return left_t, right_t, targets, state_label, month_label, species_label
+            # Ground-truth NDVI and Height for auxiliary regression
+            ndvi_target = torch.tensor(self.ndvi_values[idx], dtype=torch.float32)
+            height_target = torch.tensor(self.height_values[idx], dtype=torch.float32)
+            return left_t, right_t, targets, state_label, month_label, species_label, ndvi_target, height_target
 
         return left_t, right_t, targets
 
 
-def get_train_transforms(img_size: int = 518, aug_prob: float = 0.5) -> A.ReplayCompose:
+def get_train_transforms(img_size: int = 518, aug_prob: float = 0.5, strong: bool = False) -> A.ReplayCompose:
     """Get training augmentations with replay support for consistent stereo augmentation.
+    
+    Args:
+        img_size: Target image size
+        aug_prob: Base augmentation probability
+        strong: If True, use stronger augmentations from dinov3-5tar.ipynb notebook
     
     NOTE: This applies the SAME photometric transforms to both views (via replay),
     which may allow the model to "cheat" by matching pixel noise. For stereo-correct
     augmentations, use get_stereo_correct_transforms() instead.
     """
-    return A.ReplayCompose([
+    transforms = [
         A.Resize(img_size, img_size, interpolation=cv2.INTER_AREA),
         A.HorizontalFlip(p=aug_prob),
         A.VerticalFlip(p=aug_prob),
-        A.Affine(
-            translate_percent={"x": (-0.1, 0.1), "y": (-0.1, 0.1)},
-            scale=(0.85, 1.15),
-            rotate=(-15, 15),
-            border_mode=cv2.BORDER_REFLECT_101,
-            p=aug_prob,
-        ),
-        A.OneOf([
-            A.GaussNoise(std_range=(0.02, 0.1), p=1.0),
-            A.GaussianBlur(blur_limit=(3, 5), p=1.0),
-        ], p=0.3),
-        A.OneOf([
-            A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=1.0),
-            A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=20, val_shift_limit=20, p=1.0),
-        ], p=aug_prob),
-        A.CoarseDropout(
-            num_holes_range=(1, 8),
-            hole_height_range=(8, 32),
-            hole_width_range=(8, 32),
-            fill=0,
-            p=0.3,
-        ),
+    ]
+    
+    if strong:
+        # Strong augmentations from dinov3-5tar.ipynb
+        transforms.extend([
+            A.RandomRotate90(p=aug_prob),  # 90-degree rotations
+            A.ColorJitter(
+                brightness=0.2,
+                contrast=0.2,
+                saturation=0.2,
+                hue=0.1,
+                p=0.75,
+            ),
+            A.HueSaturationValue(
+                hue_shift_limit=20, 
+                sat_shift_limit=30, 
+                val_shift_limit=20, 
+                p=0.5,
+            ),
+            A.Affine(
+                scale=(0.9, 1.1),
+                translate_percent=(0.05, 0.05),
+                rotate=(-10, 10),
+                border_mode=cv2.BORDER_REFLECT_101,
+                p=0.3,
+            ),
+            A.RandomBrightnessContrast(
+                brightness_limit=0.2,
+                contrast_limit=0.2,
+                p=0.3,
+            ),
+            A.CoarseDropout(
+                num_holes_range=(1, 4),
+                hole_height_range=(0.1, 0.2),
+                hole_width_range=(0.1, 0.2),
+                fill=0,
+                p=0.3,
+            ),
+            A.CLAHE(p=0.2),  # Adaptive histogram equalization
+            A.MotionBlur(p=0.1),  # Motion blur
+            A.OneOf([
+                A.GaussianBlur(blur_limit=(1, 3)),
+                A.GaussNoise(std_range=(0.05, 0.1), mean_range=(0, 0), per_channel=True),
+            ], p=0.3),
+        ])
+    else:
+        # Standard augmentations
+        transforms.extend([
+            A.Affine(
+                translate_percent={"x": (-0.1, 0.1), "y": (-0.1, 0.1)},
+                scale=(0.85, 1.15),
+                rotate=(-15, 15),
+                border_mode=cv2.BORDER_REFLECT_101,
+                p=aug_prob,
+            ),
+            A.OneOf([
+                A.GaussNoise(std_range=(0.02, 0.1), p=1.0),
+                A.GaussianBlur(blur_limit=(3, 5), p=1.0),
+            ], p=0.3),
+            A.OneOf([
+                A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=1.0),
+                A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=20, val_shift_limit=20, p=1.0),
+            ], p=aug_prob),
+            A.CoarseDropout(
+                num_holes_range=(1, 8),
+                hole_height_range=(8, 32),
+                hole_width_range=(8, 32),
+                fill=0,
+                p=0.3,
+            ),
+        ])
+    
+    # Common normalization and tensor conversion
+    transforms.extend([
         A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2(),
     ])
+    
+    return A.ReplayCompose(transforms)
 
 
-def get_stereo_geometric_transforms(img_size: int = 518, aug_prob: float = 0.5) -> A.ReplayCompose:
+def get_stereo_geometric_transforms(img_size: int = 518, aug_prob: float = 0.5, strong: bool = False) -> A.ReplayCompose:
     """Get GEOMETRIC-only transforms with replay support for stereo pairs.
     
     These transforms are applied identically to both L/R views to preserve stereo geometry.
     Does NOT include normalization or ToTensorV2 - those are handled separately.
+    
+    Args:
+        img_size: Target image size
+        aug_prob: Base augmentation probability
+        strong: If True, use stronger augmentations from dinov3-5tar.ipynb
     """
-    return A.ReplayCompose([
+    transforms = [
         A.Resize(img_size, img_size, interpolation=cv2.INTER_AREA),
         A.HorizontalFlip(p=aug_prob),
         A.VerticalFlip(p=aug_prob),
-        A.Affine(
-            translate_percent={"x": (-0.1, 0.1), "y": (-0.1, 0.1)},
-            scale=(0.85, 1.15),
-            rotate=(-15, 15),
-            border_mode=cv2.BORDER_REFLECT_101,
-            p=aug_prob,
-        ),
-        A.CoarseDropout(
-            num_holes_range=(1, 8),
-            hole_height_range=(8, 32),
-            hole_width_range=(8, 32),
-            fill=0,
-            p=0.3,
-        ),
-        # No photometric transforms here - they'll be applied independently
+    ]
+    
+    if strong:
+        # Strong geometric augmentations
+        transforms.extend([
+            A.RandomRotate90(p=aug_prob),
+            A.Affine(
+                scale=(0.9, 1.1),
+                translate_percent=(0.05, 0.05),
+                rotate=(-10, 10),
+                border_mode=cv2.BORDER_REFLECT_101,
+                p=0.3,
+            ),
+            A.CoarseDropout(
+                num_holes_range=(1, 4),
+                hole_height_range=(0.1, 0.2),
+                hole_width_range=(0.1, 0.2),
+                fill=0,
+                p=0.3,
+            ),
+        ])
+    else:
+        # Standard geometric augmentations
+        transforms.extend([
+            A.Affine(
+                translate_percent={"x": (-0.1, 0.1), "y": (-0.1, 0.1)},
+                scale=(0.85, 1.15),
+                rotate=(-15, 15),
+                border_mode=cv2.BORDER_REFLECT_101,
+                p=aug_prob,
+            ),
+            A.CoarseDropout(
+                num_holes_range=(1, 8),
+                hole_height_range=(8, 32),
+                hole_width_range=(8, 32),
+                fill=0,
+                p=0.3,
+            ),
+        ])
+    
+    transforms.extend([
         A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2(),
     ])
+    
+    return A.ReplayCompose(transforms)
 
 
-def get_stereo_photometric_transforms(aug_prob: float = 0.5) -> A.Compose:
+def get_stereo_photometric_transforms(aug_prob: float = 0.5, strong: bool = False) -> A.Compose:
     """Get PHOTOMETRIC-only transforms applied INDEPENDENTLY to each stereo view.
     
     This prevents the model from "cheating" by matching identical noise/blur patterns
     between left and right images.
     
+    Args:
+        aug_prob: Base augmentation probability
+        strong: If True, use stronger augmentations from dinov3-5tar.ipynb
+    
     Input/output: normalized tensor (C, H, W) as numpy array.
     """
-    return A.Compose([
-        A.OneOf([
-            A.GaussNoise(std_range=(0.02, 0.1), p=1.0),
-            A.GaussianBlur(blur_limit=(3, 5), p=1.0),
-        ], p=0.3),
-        A.OneOf([
-            A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=1.0),
-            A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=20, val_shift_limit=20, p=1.0),
-        ], p=aug_prob),
-        ToTensorV2(),  # Convert back to tensor
-    ])
+    if strong:
+        # Strong photometric augmentations from notebook
+        return A.Compose([
+            A.ColorJitter(
+                brightness=0.2,
+                contrast=0.2,
+                saturation=0.2,
+                hue=0.1,
+                p=0.75,
+            ),
+            A.HueSaturationValue(
+                hue_shift_limit=20,
+                sat_shift_limit=30,
+                val_shift_limit=20,
+                p=0.5,
+            ),
+            A.RandomBrightnessContrast(
+                brightness_limit=0.2,
+                contrast_limit=0.2,
+                p=0.3,
+            ),
+            A.CLAHE(p=0.2),
+            A.MotionBlur(p=0.1),
+            A.OneOf([
+                A.GaussianBlur(blur_limit=(1, 3)),
+                A.GaussNoise(std_range=(0.05, 0.1), mean_range=(0, 0), per_channel=True),
+            ], p=0.3),
+            ToTensorV2(),
+        ])
+    else:
+        # Standard photometric augmentations
+        return A.Compose([
+            A.OneOf([
+                A.GaussNoise(std_range=(0.02, 0.1), p=1.0),
+                A.GaussianBlur(blur_limit=(3, 5), p=1.0),
+            ], p=0.3),
+            A.OneOf([
+                A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=1.0),
+                A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=20, val_shift_limit=20, p=1.0),
+            ], p=aug_prob),
+            ToTensorV2(),
+        ])
 
 
 def get_valid_transforms(img_size: int = 518) -> A.Compose:

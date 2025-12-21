@@ -482,8 +482,8 @@ def create_objective(
         # PHASE 0: BASIC - Essential parameters (always searched)
         # These have the highest impact on performance
         # =====================================================================
-        model_type = trial.suggest_categorical("model_type", ["softmax", "hierarchical"])
-        training_mode = trial.suggest_categorical("training_mode", ["freeze", "two_stage"])
+        model_type = trial.suggest_categorical("model_type", ["softmax", "hierarchical", "direct"])
+        training_mode = "freeze"  # Fixed: train heads only, backbone frozen
         head_lr_stage1 = trial.suggest_float("head_lr_stage1", 1e-5, 1e-3, log=True)
         batch_size = trial.suggest_categorical("batch_size", [4, 8, 16])
 
@@ -561,8 +561,8 @@ def create_objective(
         else:
             use_huber_for_dead = True
             huber_delta = 5.0
-            ratio_loss_weight = 0.0
-            ratio_loss_type = "mse"
+            ratio_loss_weight = 0.1  # Enable ratio loss
+            ratio_loss_type = "kl"   # Use KL divergence
             mixup_prob = 0.0
             mixup_alpha = 0.4
             cutmix_prob = 0.0
@@ -747,7 +747,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Optuna Search for Ratio Models")
 
     parser.add_argument("--base-path", type=str, default="./data")
-    parser.add_argument("--backbone", type=str, default="vit_base_patch14_reg4_dinov2.lvd142m")
+    parser.add_argument("--backbone", type=str, default="vit_base_patch14_reg4_dinov2.lvd142m",
+                        help="Vision backbone: DINOv2 (vit_base_patch14_reg4_dinov2.lvd142m) or "
+                             "DINOv3 (vit_base_patch16_dinov3, vit_large_patch16_dinov3)")
     parser.add_argument("--fold-csv", type=str, default="./data/trainfold.csv",
                         help="Path to CSV with predefined folds (default: ./data/trainfold.csv)")
     parser.add_argument("--n-trials", type=int, default=50)

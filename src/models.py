@@ -24,7 +24,12 @@ def _infer_input_res(model: nn.Module) -> int:
         return int(ins if isinstance(ins, (int, float)) else 224)
     
     name = dc.get("architecture", "") or str(type(model))
-    return 518 if "dinov2" in name.lower() else 224
+    if "dinov2" in name.lower():
+        return 518
+    elif "dinov3" in name.lower():
+        return 256  # DINOv3 default, but supports any size divisible by 16
+    else:
+        return 224
 
 
 def _build_dino_by_name(
