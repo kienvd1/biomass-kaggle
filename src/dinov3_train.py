@@ -496,19 +496,12 @@ def validate(
     metrics: Dict[str, float] = {}
     
     # ============================================================================
-    # OFFICIAL COMPETITION METRIC: R² in log-transformed space
-    # From paper: "y_trans = log(1 + y)"
+    # OFFICIAL COMPETITION METRIC: R² in ORIGINAL space (not log-transformed)
+    # Weights: Green=0.1, Dead=0.1, Clover=0.1, GDM=0.2, Total=0.5
     # ============================================================================
-    if use_log_transform:
-        all_preds_log = torch.log1p(all_preds_t)
-        all_targets_log = torch.log1p(all_targets_t)
-    else:
-        all_preds_log = all_preds_t
-        all_targets_log = all_targets_t
-    
     for i, name in enumerate(target_names):
-        pred_i = all_preds_log[:, i]
-        target_i = all_targets_log[:, i]
+        pred_i = all_preds_t[:, i]
+        target_i = all_targets_t[:, i]
         
         # R² = 1 - SS_res / SS_tot
         ss_res = ((pred_i - target_i) ** 2).sum()
@@ -516,20 +509,20 @@ def validate(
         r2_i = 1 - (ss_res / (ss_tot + 1e-8))
         metrics[f"r2_{name}"] = float(r2_i.item())
     
-    # Compute weighted average of per-target R² (notebook formula, NOT competition metric)
+    # Compute weighted average of per-target R² 
     avg_r2 = sum(target_weights[i] * metrics[f"r2_{name}"] for i, name in enumerate(target_names))
     metrics["avg_r2"] = avg_r2  # sum of weights = 1.0
     
     # Compute GLOBAL weighted R² (official competition metric)
     # R²_w = 1 - SS_res / SS_tot where weights are applied per (sample, target) pair
-    n_samples = all_preds_log.size(0)
-    weights_t = torch.tensor(target_weights, device=all_preds_log.device)
+    n_samples = all_preds_t.size(0)
+    weights_t = torch.tensor(target_weights, device=all_preds_t.device)
     weights_expanded = weights_t.unsqueeze(0).expand(n_samples, -1)  # (N, 5)
     
     # Flatten for global computation
     w = weights_expanded.flatten()  # (N * 5,)
-    y = all_targets_log.flatten()  # (N * 5,)
-    y_hat = all_preds_log.flatten()  # (N * 5,)
+    y = all_targets_t.flatten()  # (N * 5,)
+    y_hat = all_preds_t.flatten()  # (N * 5,)
     
     # Weighted mean of targets
     y_bar_w = (w * y).sum() / w.sum()
@@ -540,15 +533,17 @@ def validate(
     weighted_r2 = 1.0 - (ss_res / (ss_tot + 1e-8))
     metrics["weighted_r2"] = float(weighted_r2.item())
     
-    # Also compute R² in original (non-log) space for comparison
+    # Also compute R² in log-space for reference (if training uses log transform)
     if use_log_transform:
+        all_preds_log = torch.log1p(all_preds_t)
+        all_targets_log = torch.log1p(all_targets_t)
         for i, name in enumerate(target_names):
-            pred_i = all_preds_t[:, i]  # Original space
-            target_i = all_targets_t[:, i]
+            pred_i = all_preds_log[:, i]
+            target_i = all_targets_log[:, i]
             ss_res = ((pred_i - target_i) ** 2).sum()
             ss_tot = ((target_i - target_i.mean()) ** 2).sum()
             r2_i = 1 - (ss_res / (ss_tot + 1e-8))
-            metrics[f"r2_{name}_orig"] = float(r2_i.item())
+            metrics[f"r2_{name}_log"] = float(r2_i.item())
     
     # Sync MPS before returning
     if device_type == DeviceType.MPS:
@@ -593,12 +588,15 @@ def train_fold(
     # Transforms - choose photometric mode
     photometric_mode = cfg.photometric
     strong_aug = getattr(cfg, 'strong_aug', False)
+    no_lighting = getattr(cfg, 'no_lighting', False)
     use_perspective_jitter = getattr(cfg, 'use_perspective_jitter', False)
     use_border_mask = getattr(cfg, 'use_border_mask', False)
     
     if is_main_process():
         if strong_aug:
             print("Augmentation: STRONG (from dinov3-5tar.ipynb)")
+        if no_lighting:
+            print("Augmentation: NO LIGHTING (ColorJitter, HSV, Brightness, CLAHE removed)")
         if use_perspective_jitter:
             print("Augmentation: +Perspective jitter (annotation noise sim)")
         if use_border_mask:
@@ -607,7 +605,7 @@ def train_fold(
     if photometric_mode == "same":
         # Same geometric + photometric to both L/R (default)
         train_transform = get_train_transforms(
-            img_size, cfg.aug_prob, strong=strong_aug,
+            img_size, cfg.aug_prob, strong=strong_aug, no_lighting=no_lighting,
             use_perspective_jitter=use_perspective_jitter, 
             use_border_mask=use_border_mask
         )
@@ -777,8 +775,12 @@ def train_fold(
     
     # PlantHydra-style loss (best option for official metric)
     if use_planthydra or use_log_transform or use_cosine_sim or use_compositional:
+        # Determine if using log transform (default True for planthydra, can override with --no-log-transform)
+        planthydra_use_log = (use_log_transform or use_planthydra) and not getattr(cfg, 'no_log_transform', False)
         loss_fn = PlantHydraLoss(
-            use_log_transform=use_log_transform or use_planthydra,
+            use_log_transform=planthydra_use_log,
+            use_smoothl1=getattr(cfg, 'smoothl1', False),
+            smoothl1_beta=getattr(cfg, 'smoothl1_beta', 1.0),
             use_cosine_sim=use_cosine_sim or use_planthydra,
             cosine_weight=getattr(cfg, 'cosine_weight', 0.4),
             use_compositional=use_compositional or use_planthydra,
@@ -1174,7 +1176,7 @@ def main() -> None:
     
     # Data
     parser.add_argument("--base-path", type=str, default="./data")
-    parser.add_argument("--fold-csv", type=str, default="data/trainfold_group_location.csv",
+    parser.add_argument("--fold-csv", type=str, default="data/trainfold_group_month_species.csv",
                         help="Path to CSV with predefined folds (sample_id_prefix, fold)")
     parser.add_argument("--use-predefined-folds", action="store_true", default=True,
                         help="Use predefined folds from --fold-csv (default: True)")
@@ -1333,7 +1335,7 @@ def main() -> None:
                         help="Early stopping patience for Stage 2 (default: --patience)")
     
     # Training params
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--grad-accum", type=int, default=1,
                         help="Gradient accumulation steps. Use with DDP to restore single-GPU update frequency")
@@ -1357,6 +1359,8 @@ def main() -> None:
                         help="Use strong augmentations (RandomRotate90, ColorJitter, CLAHE, MotionBlur)")
     parser.add_argument("--no-strong-aug", action="store_false", dest="strong_aug",
                         help="Disable strong augmentations, use basic transforms only")
+    parser.add_argument("--no-lighting", action="store_true", default=False,
+                        help="Remove lighting augmentations (ColorJitter, HSV, Brightness, CLAHE)")
     parser.add_argument("--photometric", type=str, default="same",
                         choices=["same", "independent", "left", "right", "none"],
                         help="Photometric transform mode: "
@@ -1387,12 +1391,16 @@ def main() -> None:
                         help="Use SmoothL1 loss on 3 targets (Total, GDM, Green) - default")
     parser.add_argument("--no-smoothl1", action="store_false", dest="smoothl1",
                         help="Use MSE loss on all 5 targets instead of SmoothL1")
+    parser.add_argument("--smoothl1-beta", type=float, default=1.0,
+                        help="Beta for SmoothL1 loss (transition point between L1 and L2)")
     
     # PlantHydra-style loss (from 1st place solution)
     parser.add_argument("--use-planthydra-loss", action="store_true",
                         help="Use PlantHydra-style loss: log-transform + cosine similarity + compositional consistency")
     parser.add_argument("--use-log-transform", action="store_true",
                         help="Apply log(1+y) transform (official competition metric)")
+    parser.add_argument("--no-log-transform", action="store_true", default=False,
+                        help="Disable log transform for PlantHydra loss (train on raw values)")
     parser.add_argument("--use-cosine-sim", action="store_true",
                         help="Add cosine similarity loss to maintain correlation structure")
     parser.add_argument("--cosine-weight", type=float, default=0.4,
@@ -1454,18 +1462,48 @@ def main() -> None:
         args.output_dir = f"./outputs/dinov3_{timestamp}"
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # Save command for reproducibility
-    import sys
+    # Save command for reproducibility (only log relevant args)
     command_path = os.path.join(args.output_dir, "command.txt")
+    
+    # Map weight args to their enabling flags (skip weight if feature disabled)
+    weight_to_feature = {
+        "ndvi_weight": "use_ndvi_head",
+        "height_weight": "use_height_head",
+        "cross_view_weight": "use_cross_view_consistency",
+        "qc_weight": "use_qc_plausibility",
+        "mass_balance_weight": "use_mass_balance",
+        "aos_weight": "use_aos_hallucination",
+        "calibrated_depth_weight": "use_calibrated_depth",
+        "presence_weight": "use_presence_heads",
+        "cosine_weight": "use_cosine_sim",
+        "compositional_weight": "use_compositional",
+        "state_weight": "use_state_head",
+        "aux_state_weight": "use_aux_heads",
+        "aux_month_weight": "use_aux_heads",
+        "aux_species_weight": "use_aux_heads",
+        "tweedie_p": "use_tweedie",
+        "huber_delta": "use_huber",
+        "depth_model_size": "use_depth",
+        "depth_attention": "use_depth",
+    }
+    # Skip these if they have default values
+    skip_defaults = {"rank", "world_size", "device_type"}
+    
     with open(command_path, "w") as f:
         f.write("# Command to reproduce this training run\n")
         f.write("python -m src.dinov3_train \\\n")
-        # Write each argument on its own line for readability
         for key, value in vars(args).items():
-            if key in ("output_dir", "image_dir"):  # Skip auto-generated paths
+            if key in ("output_dir", "image_dir"):
+                continue
+            if key in skip_defaults:
                 continue
             if value is None or value is False:
                 continue
+            # Skip weight args if their feature is disabled
+            if key in weight_to_feature:
+                feature_flag = weight_to_feature[key]
+                if not getattr(args, feature_flag, False):
+                    continue
             if value is True:
                 f.write(f"    --{key.replace('_', '-')} \\\n")
             elif isinstance(value, list):

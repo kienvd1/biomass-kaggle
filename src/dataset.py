@@ -417,6 +417,7 @@ def get_train_transforms(
     img_size: int = 518, 
     aug_prob: float = 0.5, 
     strong: bool = False,
+    no_lighting: bool = False,
     use_perspective_jitter: bool = False,
     use_border_mask: bool = False,
 ) -> A.ReplayCompose:
@@ -470,31 +471,23 @@ def get_train_transforms(
     
     if strong:
         # Strong augmentations from dinov3-5tar.ipynb
+        transforms.append(A.RandomRotate90(p=aug_prob))
+        
+        # Lighting augmentations (skip if no_lighting=True)
+        if not no_lighting:
+            transforms.extend([
+                A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.75),
+                A.HueSaturationValue(hue_shift_limit=20, sat_shift_limit=30, val_shift_limit=20, p=0.5),
+                A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.3),
+                A.CLAHE(p=0.2),
+            ])
+        
         transforms.extend([
-            A.RandomRotate90(p=aug_prob),  # 90-degree rotations
-            A.ColorJitter(
-                brightness=0.2,
-                contrast=0.2,
-                saturation=0.2,
-                hue=0.1,
-                p=0.75,
-            ),
-            A.HueSaturationValue(
-                hue_shift_limit=20, 
-                sat_shift_limit=30, 
-                val_shift_limit=20, 
-                p=0.5,
-            ),
             A.Affine(
                 scale=(0.9, 1.1),
                 translate_percent=(0.05, 0.05),
                 rotate=(-10, 10),
                 border_mode=cv2.BORDER_REFLECT_101,
-                p=0.3,
-            ),
-            A.RandomBrightnessContrast(
-                brightness_limit=0.2,
-                contrast_limit=0.2,
                 p=0.3,
             ),
             A.CoarseDropout(
@@ -504,8 +497,7 @@ def get_train_transforms(
                 fill=0,
                 p=0.3,
             ),
-            A.CLAHE(p=0.2),  # Adaptive histogram equalization
-            A.MotionBlur(p=0.1),  # Motion blur
+            A.MotionBlur(p=0.1),
             A.OneOf([
                 A.GaussianBlur(blur_limit=(1, 3)),
                 A.GaussNoise(std_range=(0.05, 0.1), mean_range=(0, 0), per_channel=True),

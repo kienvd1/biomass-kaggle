@@ -1756,6 +1756,8 @@ class PlantHydraLoss(nn.Module):
     def __init__(
         self,
         use_log_transform: bool = True,
+        use_smoothl1: bool = False,
+        smoothl1_beta: float = 1.0,
         use_cosine_sim: bool = True,
         cosine_weight: float = 0.4,
         use_compositional: bool = True,
@@ -1774,6 +1776,8 @@ class PlantHydraLoss(nn.Module):
         super().__init__()
         
         self.use_log_transform = use_log_transform
+        self.use_smoothl1 = use_smoothl1
+        self.smoothl1_beta = smoothl1_beta
         self.use_cosine_sim = use_cosine_sim
         self.cosine_weight = cosine_weight
         self.use_compositional = use_compositional
@@ -1837,12 +1841,20 @@ class PlantHydraLoss(nn.Module):
             pred_log = pred_clamped
             target_log = target
         
-        # 2. Weighted MSE loss in log space (approximates R² optimization)
-        mse_per_target = ((pred_log - target_log) ** 2).mean(dim=0)  # (5,)
-        weighted_mse = (weights * mse_per_target).sum()
-        loss_dict["mse"] = weighted_mse.item()
+        # 2. Weighted base loss (MSE or SmoothL1)
+        if self.use_smoothl1:
+            # SmoothL1 per target
+            loss_per_target = F.smooth_l1_loss(
+                pred_log, target_log, reduction='none', beta=self.smoothl1_beta
+            ).mean(dim=0)  # (5,)
+            loss_dict["smoothl1"] = (weights * loss_per_target).sum().item()
+        else:
+            # MSE per target (approximates R² optimization)
+            loss_per_target = ((pred_log - target_log) ** 2).mean(dim=0)  # (5,)
+            loss_dict["mse"] = (weights * loss_per_target).sum().item()
         
-        total_loss = weighted_mse
+        weighted_loss = (weights * loss_per_target).sum()
+        total_loss = weighted_loss
         
         # 3. Cosine similarity loss (from PlantHydra)
         # Maintains correlation structure between all 5 targets
