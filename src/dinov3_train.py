@@ -797,12 +797,14 @@ def train_fold(
             train_clover=cfg.train_clover,
         )
         extras_loss = ["PlantHydra"]
-        if use_log_transform or use_planthydra:
+        if planthydra_use_log:  # Fixed: use actual log setting
             extras_loss.append("LogTransform")
+        else:
+            extras_loss.append("RawValues")
         if use_cosine_sim or use_planthydra:
-            extras_loss.append(f"CosineSim(w={cfg.cosine_weight:.1f})")
+            extras_loss.append(f"CosineSim(w={getattr(cfg, 'cosine_weight', 0.4):.2f})")
         if use_compositional or use_planthydra:
-            extras_loss.append(f"Compositional(w={cfg.compositional_weight:.1f})")
+            extras_loss.append(f"Compositional(w={getattr(cfg, 'compositional_weight', 0.1):.2f})")
         if use_height:
             extras_loss.append(f"Height(w={cfg.height_weight:.1f})")
         if use_ndvi:
