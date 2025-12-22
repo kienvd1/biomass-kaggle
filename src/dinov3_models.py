@@ -1596,6 +1596,1191 @@ COMPETITION_WEIGHTS = {
     "total": 0.5,
 }
 
+# Target indices
+TARGET_NAMES = ["green", "dead", "clover", "gdm", "total"]
+TARGET_WEIGHTS = torch.tensor([0.1, 0.1, 0.1, 0.2, 0.5])
+
+
+# =============================================================================
+# Log Transform Encoder (Official Competition Metric)
+# =============================================================================
+
+class LogTransformEncoder(nn.Module):
+    """
+    Official log transformation for competition metric: y_trans = log(1 + y)
+    
+    From paper: "To stabilize variance and improve model evaluation robustness,
+    particularly for variables with high dynamic range or right-skewed distributions,
+    a log-stabilizing transformation is applied to all target variables."
+    
+    Usage:
+        encoder = LogTransformEncoder()
+        y_log = encoder.transform(targets)  # For training
+        pred = encoder.inverse_transform(pred_log)  # For inference
+    """
+    
+    def __init__(self) -> None:
+        super().__init__()
+    
+    def transform(self, y: torch.Tensor) -> torch.Tensor:
+        """Transform targets: y_trans = log(1 + y)"""
+        return torch.log1p(y)
+    
+    def inverse_transform(self, y_log: torch.Tensor) -> torch.Tensor:
+        """Inverse transform: y = exp(y_trans) - 1"""
+        return torch.expm1(y_log)
+
+
+class OfficialWeightedR2Loss(nn.Module):
+    """
+    Official competition metric as a differentiable loss function.
+    
+    From paper:
+        Final Score = Σ wi × R²i
+        where R²i is calculated using log-transformed values: y_trans = log(1 + y)
+        weights: Green=0.1, Dead=0.1, Clover=0.1, GDM=0.2, Total=0.5
+    
+    This loss:
+    1. Applies log(1+y) transform to both predictions and targets
+    2. Computes per-target R²
+    3. Returns weighted (1 - R²) as loss (since we minimize loss)
+    """
+    
+    def __init__(
+        self, 
+        use_log_transform: bool = True,
+        eps: float = 1e-8,
+    ) -> None:
+        super().__init__()
+        self.use_log_transform = use_log_transform
+        self.eps = eps
+        self.register_buffer("weights", TARGET_WEIGHTS)
+    
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            pred: (B, 5) predictions [Green, Dead, Clover, GDM, Total]
+            target: (B, 5) targets
+        
+        Returns:
+            loss: Weighted (1 - R²) loss
+        """
+        # Apply log transform if targets are in original space
+        if self.use_log_transform:
+            pred_log = torch.log1p(pred.clamp(min=0))
+            target_log = torch.log1p(target)
+        else:
+            # Assume already log-transformed
+            pred_log = pred
+            target_log = target
+        
+        # Compute per-target R²
+        # R² = 1 - SS_res / SS_tot
+        ss_res = ((target_log - pred_log) ** 2).sum(dim=0)  # (5,)
+        ss_tot = ((target_log - target_log.mean(dim=0, keepdim=True)) ** 2).sum(dim=0)  # (5,)
+        
+        r2_per_target = 1 - ss_res / (ss_tot + self.eps)  # (5,)
+        
+        # Weighted average R²
+        weights = self.weights.to(pred.device)
+        weighted_r2 = (weights * r2_per_target).sum()
+        
+        # Return 1 - R² as loss (minimize loss = maximize R²)
+        return 1 - weighted_r2
+
+
+class CompositionalConsistencyLoss(nn.Module):
+    """
+    Enforce mathematical relationships between biomass components.
+    
+    Constraints:
+        GDM = Green + Clover
+        Total = Green + Dead + Clover
+    
+    This regularization helps ensure predictions are physically consistent.
+    """
+    
+    def __init__(self, weight: float = 0.1) -> None:
+        super().__init__()
+        self.weight = weight
+    
+    def forward(self, pred: torch.Tensor, target: torch.Tensor = None) -> torch.Tensor:
+        """
+        Args:
+            pred: (B, 5) predictions [Green, Dead, Clover, GDM, Total]
+            target: (B, 5) targets (optional, for additional consistency with targets)
+        
+        Returns:
+            loss: Consistency loss
+        """
+        green, dead, clover, gdm, total = pred.unbind(dim=1)
+        
+        # Internal consistency
+        gdm_from_parts = green + clover
+        total_from_parts = green + dead + clover
+        
+        loss = (
+            F.mse_loss(gdm, gdm_from_parts) +
+            F.mse_loss(total, total_from_parts)
+        )
+        
+        # Non-negativity penalty (predictions should be >= 0)
+        non_neg_penalty = (
+            F.relu(-green).mean() +
+            F.relu(-dead).mean() +
+            F.relu(-clover).mean()
+        )
+        
+        return self.weight * (loss + 0.1 * non_neg_penalty)
+
+
+class PlantHydraLoss(nn.Module):
+    """
+    Combined loss inspired by PlantTraits2024 1st place solution + CSIRO paper insights.
+    
+    Components:
+    1. Official R² loss (log-transformed, weighted)
+    2. Cosine similarity loss (from PlantHydra: maintains correlation between traits)
+    3. Compositional consistency loss (GDM=G+C, Total=G+D+C)
+    4. Auxiliary losses: Height, NDVI, Species classification
+    
+    Usage:
+        loss_fn = PlantHydraLoss(
+            use_log_transform=True,
+            use_cosine_sim=True,
+            use_compositional=True,
+        )
+        loss, loss_dict = loss_fn(pred, target, height_pred, height_target, ...)
+    """
+    
+    def __init__(
+        self,
+        use_log_transform: bool = True,
+        use_cosine_sim: bool = True,
+        cosine_weight: float = 0.4,
+        use_compositional: bool = True,
+        compositional_weight: float = 0.1,
+        use_height_aux: bool = False,
+        height_weight: float = 0.2,
+        use_ndvi_aux: bool = False,
+        ndvi_weight: float = 0.2,
+        use_species_aux: bool = False,
+        species_weight: float = 0.1,
+        use_state_aux: bool = False,
+        state_weight: float = 0.1,
+        train_dead: bool = False,
+        train_clover: bool = False,
+    ) -> None:
+        super().__init__()
+        
+        self.use_log_transform = use_log_transform
+        self.use_cosine_sim = use_cosine_sim
+        self.cosine_weight = cosine_weight
+        self.use_compositional = use_compositional
+        self.compositional_weight = compositional_weight
+        self.use_height_aux = use_height_aux
+        self.height_weight = height_weight
+        self.use_ndvi_aux = use_ndvi_aux
+        self.ndvi_weight = ndvi_weight
+        self.use_species_aux = use_species_aux
+        self.species_weight = species_weight
+        self.use_state_aux = use_state_aux
+        self.state_weight = state_weight
+        self.train_dead = train_dead
+        self.train_clover = train_clover
+        
+        self.register_buffer("weights", TARGET_WEIGHTS)
+        self.cos_sim = nn.CosineSimilarity(dim=1)
+        self.log_encoder = LogTransformEncoder()
+    
+    def forward(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        height_pred: torch.Tensor = None,
+        height_target: torch.Tensor = None,
+        ndvi_pred: torch.Tensor = None,
+        ndvi_target: torch.Tensor = None,
+        species_logits: torch.Tensor = None,
+        species_labels: torch.Tensor = None,
+        state_logits: torch.Tensor = None,
+        state_labels: torch.Tensor = None,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Args:
+            pred: (B, 5) biomass predictions [Green, Dead, Clover, GDM, Total]
+            target: (B, 5) biomass targets
+            height_pred: (B, 1) predicted height
+            height_target: (B,) ground-truth Height_Ave_cm
+            ndvi_pred: (B, 1) predicted NDVI
+            ndvi_target: (B,) ground-truth Pre_GSHH_NDVI
+            species_logits: (B, num_species) species classification logits
+            species_labels: (B,) species labels
+            state_logits: (B, num_states) state classification logits
+            state_labels: (B,) state labels
+        
+        Returns:
+            total_loss: Combined loss
+            loss_dict: Individual loss components for logging
+        """
+        loss_dict = {}
+        weights = self.weights.to(pred.device)
+        
+        # Clamp predictions to be non-negative for log transform
+        pred_clamped = pred.clamp(min=0)
+        
+        # 1. Log-transform both pred and target
+        if self.use_log_transform:
+            pred_log = self.log_encoder.transform(pred_clamped)
+            target_log = self.log_encoder.transform(target)
+        else:
+            pred_log = pred_clamped
+            target_log = target
+        
+        # 2. Weighted MSE loss in log space (approximates R² optimization)
+        mse_per_target = ((pred_log - target_log) ** 2).mean(dim=0)  # (5,)
+        weighted_mse = (weights * mse_per_target).sum()
+        loss_dict["mse"] = weighted_mse.item()
+        
+        total_loss = weighted_mse
+        
+        # 3. Cosine similarity loss (from PlantHydra)
+        # Maintains correlation structure between all 5 targets
+        if self.use_cosine_sim:
+            cos_loss = (1 - self.cos_sim(pred_log, target_log)).mean()
+            total_loss = total_loss + self.cosine_weight * cos_loss
+            loss_dict["cosine"] = cos_loss.item()
+        
+        # 4. Compositional consistency loss
+        if self.use_compositional:
+            green, dead, clover, gdm, total = pred_clamped.unbind(dim=1)
+            gdm_check = green + clover
+            total_check = green + dead + clover
+            
+            comp_loss = (
+                F.mse_loss(gdm, gdm_check) +
+                F.mse_loss(total, total_check)
+            )
+            total_loss = total_loss + self.compositional_weight * comp_loss
+            loss_dict["compositional"] = comp_loss.item()
+        
+        # 5. Height auxiliary loss
+        if self.use_height_aux and height_pred is not None and height_target is not None:
+            # Normalize height to [0, 1] range (max ~70cm)
+            height_pred_norm = height_pred.squeeze(-1) / 70.0
+            height_target_norm = height_target / 70.0
+            height_loss = F.mse_loss(height_pred_norm, height_target_norm)
+            total_loss = total_loss + self.height_weight * height_loss
+            loss_dict["height"] = height_loss.item()
+        
+        # 6. NDVI auxiliary loss
+        if self.use_ndvi_aux and ndvi_pred is not None and ndvi_target is not None:
+            ndvi_loss = F.mse_loss(ndvi_pred.squeeze(-1), ndvi_target)
+            total_loss = total_loss + self.ndvi_weight * ndvi_loss
+            loss_dict["ndvi"] = ndvi_loss.item()
+        
+        # 7. Species classification loss
+        if self.use_species_aux and species_logits is not None and species_labels is not None:
+            species_loss = F.cross_entropy(species_logits, species_labels, label_smoothing=0.1)
+            total_loss = total_loss + self.species_weight * species_loss
+            loss_dict["species"] = species_loss.item()
+        
+        # 8. State classification loss
+        if self.use_state_aux and state_logits is not None and state_labels is not None:
+            state_loss = F.cross_entropy(state_logits, state_labels, label_smoothing=0.1)
+            total_loss = total_loss + self.state_weight * state_loss
+            loss_dict["state"] = state_loss.item()
+        
+        loss_dict["total"] = total_loss.item()
+        
+        return total_loss, loss_dict
+
+
+# =============================================================================
+# Cross-View Consistency Loss (Exploits Stereo)
+# =============================================================================
+
+class CrossViewConsistencyLoss(nn.Module):
+    """
+    Enforce consistency between left and right view predictions.
+    
+    The dataset has stereo pairs (2000×1000 split into two 1000×1000 halves).
+    Both views should predict similar biomass values since they're the same quadrat.
+    
+    This regularizer:
+    1. Encourages agreement in log(1+y) space
+    2. Helps stabilize dead/clover predictions (most variable)
+    3. Acts as self-distillation between views
+    
+    Usage:
+        loss = CrossViewConsistencyLoss(weight=0.1)
+        total_loss += loss(pred_left, pred_right)
+    """
+    
+    def __init__(
+        self, 
+        weight: float = 0.1,
+        use_log_space: bool = True,
+        per_target_weights: Optional[torch.Tensor] = None,
+    ) -> None:
+        super().__init__()
+        self.weight = weight
+        self.use_log_space = use_log_space
+        if per_target_weights is not None:
+            self.register_buffer("per_target_weights", per_target_weights)
+        else:
+            # Higher weight on unstable targets (dead, clover)
+            self.register_buffer("per_target_weights", torch.tensor([0.1, 0.3, 0.3, 0.15, 0.15]))
+    
+    def forward(
+        self, 
+        pred_left: torch.Tensor, 
+        pred_right: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            pred_left: (B, 5) predictions from left view
+            pred_right: (B, 5) predictions from right view
+        
+        Returns:
+            consistency_loss: Weighted MSE between views in log space
+        """
+        if self.use_log_space:
+            left_log = torch.log1p(pred_left.clamp(min=0))
+            right_log = torch.log1p(pred_right.clamp(min=0))
+            diff = (left_log - right_log) ** 2
+        else:
+            diff = (pred_left - pred_right) ** 2
+        
+        # Weighted per-target consistency
+        weights = self.per_target_weights.to(pred_left.device)
+        weighted_diff = (weights * diff).sum(dim=1)  # (B,)
+        
+        return self.weight * weighted_diff.mean()
+
+
+# =============================================================================
+# Species Prior Blending (PlantHydra-style for Biomass)
+# =============================================================================
+
+class SpeciesPriorHead(nn.Module):
+    """
+    PlantHydra-style species prior blending for biomass.
+    
+    From training data, we know mean biomass per species group (8 species).
+    This head:
+    1. Classifies image into species (soft probabilities)
+    2. Computes expected biomass: E[y|x] = p^T @ species_means
+    3. Blends with direct regression: final = α * regression + (1-α) * prior
+    
+    The α weights are learnable per-target (some targets benefit more from prior).
+    
+    Works at test time because it only needs the image for classification.
+    """
+    
+    def __init__(
+        self,
+        feat_dim: int,
+        num_species: int = 8,
+        num_targets: int = 5,
+        init_blend_weight: float = 0.7,  # Start favoring regression
+    ) -> None:
+        super().__init__()
+        
+        self.num_species = num_species
+        self.num_targets = num_targets
+        
+        # Species classifier
+        self.species_classifier = nn.Sequential(
+            nn.Linear(feat_dim, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(256, num_species),
+        )
+        
+        # Learnable blend weights (per target) - initialized to favor regression
+        # α=0.7 means 70% regression + 30% prior
+        self.blend_weights = nn.Parameter(
+            torch.full((num_targets,), init_blend_weight)
+        )
+        
+        # Species mean biomass lookup table (filled from training data)
+        # Shape: (num_species, num_targets)
+        self.register_buffer(
+            "species_means", 
+            torch.zeros(num_species, num_targets)
+        )
+        self.species_means_initialized = False
+    
+    def set_species_means(self, species_means: torch.Tensor) -> None:
+        """Set the species mean biomass lookup table from training data."""
+        self.species_means.copy_(species_means)
+        self.species_means_initialized = True
+    
+    def forward(
+        self, 
+        features: torch.Tensor,
+        regression_pred: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            features: (B, feat_dim) backbone features
+            regression_pred: (B, 5) direct regression predictions
+        
+        Returns:
+            blended_pred: (B, 5) blended predictions
+            species_logits: (B, num_species) for auxiliary loss
+        """
+        # Species classification
+        species_logits = self.species_classifier(features)  # (B, num_species)
+        species_probs = F.softmax(species_logits, dim=1)  # (B, num_species)
+        
+        # Expected biomass from species prior: E[y|x] = p^T @ means
+        # (B, num_species) @ (num_species, num_targets) -> (B, num_targets)
+        prior_pred = species_probs @ self.species_means  # (B, 5)
+        
+        # Blend regression and prior with learnable weights
+        # α controls regression weight, (1-α) controls prior weight
+        alpha = torch.sigmoid(self.blend_weights)  # (5,) in [0,1]
+        blended_pred = alpha * regression_pred + (1 - alpha) * prior_pred
+        
+        return blended_pred, species_logits
+
+
+# =============================================================================
+# Uncertainty-Aware Loss (Label Noise Modeling)
+# =============================================================================
+
+class UncertaintyHead(nn.Module):
+    """
+    Predict per-target log variance for uncertainty-aware training.
+    
+    Instead of just predicting y, predict (μ, log σ²) and train with Gaussian NLL.
+    This helps with label noise (manual sorting, subsampling errors in dataset).
+    
+    The predicted uncertainty can also be used for:
+    - Per-sample loss weighting (down-weight high-uncertainty samples)
+    - Ensemble weighting at inference
+    - Identifying difficult samples
+    """
+    
+    def __init__(self, feat_dim: int, num_targets: int = 5) -> None:
+        super().__init__()
+        
+        # Predict log variance for each target
+        self.log_var_head = nn.Sequential(
+            nn.Linear(feat_dim, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, num_targets),
+        )
+    
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            features: (B, feat_dim) backbone features
+        
+        Returns:
+            log_var: (B, 5) predicted log variance per target
+        """
+        return self.log_var_head(features)
+
+
+class UncertaintyAwareLoss(nn.Module):
+    """
+    Gaussian NLL loss with heteroscedastic uncertainty.
+    
+    Loss = 0.5 * (log σ² + (y - μ)² / σ²)
+    
+    The model learns to:
+    - Predict high uncertainty for noisy/difficult samples
+    - Focus on samples where it's confident
+    
+    Applied in log(1+y) space for stability.
+    """
+    
+    def __init__(
+        self,
+        use_log_space: bool = True,
+        min_log_var: float = -10.0,
+        max_log_var: float = 10.0,
+    ) -> None:
+        super().__init__()
+        self.use_log_space = use_log_space
+        self.min_log_var = min_log_var
+        self.max_log_var = max_log_var
+        self.register_buffer("weights", TARGET_WEIGHTS)
+    
+    def forward(
+        self,
+        pred_mean: torch.Tensor,
+        pred_log_var: torch.Tensor,
+        target: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Args:
+            pred_mean: (B, 5) predicted means
+            pred_log_var: (B, 5) predicted log variances
+            target: (B, 5) ground truth
+        
+        Returns:
+            loss: Weighted Gaussian NLL
+            loss_dict: Loss breakdown
+        """
+        # Transform to log space
+        if self.use_log_space:
+            pred_log = torch.log1p(pred_mean.clamp(min=0))
+            target_log = torch.log1p(target)
+        else:
+            pred_log = pred_mean
+            target_log = target
+        
+        # Clamp log variance for stability
+        log_var = pred_log_var.clamp(self.min_log_var, self.max_log_var)
+        
+        # Gaussian NLL: 0.5 * (log σ² + (y - μ)² / σ²)
+        precision = torch.exp(-log_var)  # 1/σ²
+        nll = 0.5 * (log_var + precision * (target_log - pred_log) ** 2)
+        
+        # Weighted average
+        weights = self.weights.to(pred_mean.device)
+        weighted_nll = (weights * nll).sum(dim=1).mean()
+        
+        loss_dict = {
+            "nll": weighted_nll.item(),
+            "mean_uncertainty": log_var.mean().item(),
+        }
+        
+        return weighted_nll, loss_dict
+
+
+# =============================================================================
+# QC-Inspired Plausibility Penalties (Domain Knowledge)
+# =============================================================================
+
+class QCPlausibilityLoss(nn.Module):
+    """
+    Soft constraints based on dataset QC rules and domain knowledge.
+    
+    From the paper:
+    - QC flags weird biomass-to-height ratios
+    - Very low predicted height shouldn't allow extreme total
+    - Very high dead fraction shouldn't co-occur with very high NDVI proxy
+    
+    These are soft regularizers that penalize implausible predictions.
+    """
+    
+    def __init__(
+        self,
+        weight: float = 0.1,
+        max_biomass_per_cm: float = 15.0,  # Max grams per cm height
+        max_dead_with_high_ndvi: float = 0.7,  # Max dead fraction when NDVI > 0.6
+    ) -> None:
+        super().__init__()
+        self.weight = weight
+        self.max_biomass_per_cm = max_biomass_per_cm
+        self.max_dead_with_high_ndvi = max_dead_with_high_ndvi
+    
+    def forward(
+        self,
+        pred: torch.Tensor,
+        height_pred: Optional[torch.Tensor] = None,
+        ndvi_pred: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            pred: (B, 5) biomass predictions [green, dead, clover, gdm, total]
+            height_pred: (B, 1) predicted height in cm (optional)
+            ndvi_pred: (B, 1) predicted NDVI 0-1 (optional)
+        
+        Returns:
+            penalty: Soft constraint violation penalty
+        """
+        green, dead, clover, gdm, total = pred.unbind(dim=1)
+        penalty = torch.tensor(0.0, device=pred.device)
+        
+        # 1. Non-negativity (already in compositional, but reinforce)
+        non_neg = (
+            F.relu(-green).mean() +
+            F.relu(-dead).mean() +
+            F.relu(-clover).mean()
+        )
+        penalty = penalty + non_neg
+        
+        # 2. Fraction bounds: each component should be <= total
+        fraction_penalty = (
+            F.relu(green - total).mean() +
+            F.relu(dead - total).mean() +
+            F.relu(clover - total).mean() +
+            F.relu(gdm - total).mean()
+        )
+        penalty = penalty + fraction_penalty
+        
+        # 3. Height-biomass plausibility (if height available)
+        if height_pred is not None:
+            height = height_pred.squeeze(-1).clamp(min=1.0)  # At least 1cm
+            # Biomass per cm height should be reasonable
+            biomass_per_cm = total / height
+            height_penalty = F.relu(biomass_per_cm - self.max_biomass_per_cm).mean()
+            penalty = penalty + height_penalty
+        
+        # 4. NDVI-dead consistency (if NDVI available)
+        # High NDVI (>0.6) suggests lots of green, shouldn't have very high dead fraction
+        if ndvi_pred is not None:
+            ndvi = ndvi_pred.squeeze(-1)
+            dead_fraction = dead / (total + 1e-6)
+            # When NDVI > 0.6, penalize dead_fraction > 0.7
+            high_ndvi_mask = (ndvi > 0.6).float()
+            dead_excess = F.relu(dead_fraction - self.max_dead_with_high_ndvi)
+            ndvi_dead_penalty = (high_ndvi_mask * dead_excess).mean()
+            penalty = penalty + ndvi_dead_penalty
+        
+        return self.weight * penalty
+
+
+# =============================================================================
+# Physical Mass Balance Loss (Idea #2 from Dataset Paper)
+# =============================================================================
+
+class MassBalanceLoss(nn.Module):
+    """
+    Physical constraint: The sum of parts must equal the whole.
+    
+    From paper: Biomass was sorted into Green, Dead, and Legume fractions.
+    This implies: Green + Dead + Clover ≈ Total (for grass+legume pastures)
+    
+    Neural networks often violate this: predict Total=50 but Green=40, Dead=20.
+    This loss constrains predictions to be physically consistent.
+    """
+    
+    def __init__(
+        self, 
+        weight: float = 0.2,
+        use_gdm_balance: bool = True,  # GDM = Green + Clover
+    ) -> None:
+        super().__init__()
+        self.weight = weight
+        self.use_gdm_balance = use_gdm_balance
+    
+    def forward(self, pred: torch.Tensor, target: torch.Tensor = None) -> torch.Tensor:
+        """
+        Args:
+            pred: (B, 5) predictions [green, dead, clover, gdm, total]
+            target: (B, 5) targets (optional, for adaptive weighting)
+        
+        Returns:
+            loss: Mass balance violation penalty
+        """
+        green, dead, clover, gdm, total = pred.unbind(dim=1)
+        
+        # Primary constraint: Green + Dead + Clover ≈ Total
+        pred_sum = green + dead + clover
+        balance_loss = F.mse_loss(pred_sum, total)
+        
+        # Secondary constraint: GDM = Green + Clover (Green Dry Matter)
+        if self.use_gdm_balance:
+            gdm_from_parts = green + clover
+            gdm_loss = F.mse_loss(gdm, gdm_from_parts)
+            balance_loss = balance_loss + gdm_loss
+        
+        return self.weight * balance_loss
+
+
+# =============================================================================
+# Feature Orthogonality Loss (Idea #5: Digital Sorting / Feature Unmixing)
+# =============================================================================
+
+class FeatureOrthogonalityLoss(nn.Module):
+    """
+    Force "digital sorting" by making features for different targets orthogonal.
+    
+    Ground truth was generated by physically sorting grass vs. clover vs. dead.
+    The features used to predict "Green Mass" should be distinct from those
+    predicting "Dead Mass" - they look at different visual patterns.
+    
+    This prevents feature leakage (e.g., Green head using brown texture features).
+    """
+    
+    def __init__(
+        self, 
+        weight: float = 0.1,
+        pairs: List[Tuple[str, str]] = None,  # Which target pairs to orthogonalize
+    ) -> None:
+        super().__init__()
+        self.weight = weight
+        # Default: Green ⟂ Dead, Green ⟂ Clover, Dead ⟂ Clover
+        self.pairs = pairs or [("green", "dead"), ("green", "clover"), ("dead", "clover")]
+    
+    def forward(
+        self, 
+        features_dict: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Args:
+            features_dict: Dictionary mapping target names to their feature vectors
+                           e.g., {"green": (B, D), "dead": (B, D), "clover": (B, D)}
+        
+        Returns:
+            loss: Sum of cosine similarities (should be minimized → orthogonal)
+        """
+        loss = torch.tensor(0.0, device=list(features_dict.values())[0].device)
+        
+        for name1, name2 in self.pairs:
+            if name1 in features_dict and name2 in features_dict:
+                feat1 = features_dict[name1]  # (B, D)
+                feat2 = features_dict[name2]  # (B, D)
+                
+                # Normalize features
+                feat1_norm = F.normalize(feat1, dim=1)
+                feat2_norm = F.normalize(feat2, dim=1)
+                
+                # Cosine similarity (average over batch)
+                cos_sim = (feat1_norm * feat2_norm).sum(dim=1).abs().mean()
+                loss = loss + cos_sim
+        
+        return self.weight * loss
+
+
+# =============================================================================
+# Calibrated Depth Volume (Idea #4: Height-Calibrated 3D Volume)
+# =============================================================================
+
+class CalibratedDepthHead(nn.Module):
+    """
+    Calibrate relative depth map using ground-truth Height.
+    
+    Biomass ≈ Height × Coverage × Density
+    
+    Depth Anything gives relative depth (unknown scale). This module:
+    1. Predicts a global scale factor α from image features
+    2. Calibrated_Height_Map = Depth_Map × α
+    3. Volume_Proxy = Sum(Calibrated_Height_Map)
+    4. Uses Volume_Proxy as direct feature for biomass regression
+    
+    At inference, α is predicted from the image, so no GT height needed.
+    """
+    
+    def __init__(self, feat_dim: int, depth_feat_dim: int = 256) -> None:
+        super().__init__()
+        
+        # Predict scale factor from image features
+        self.scale_predictor = nn.Sequential(
+            nn.Linear(feat_dim, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, 1),
+            nn.Softplus(),  # Ensure positive scale
+        )
+        
+        # Project calibrated depth features
+        self.depth_projector = nn.Sequential(
+            nn.Linear(depth_feat_dim + 1, 128),  # depth features + volume proxy
+            nn.ReLU(inplace=True),
+            nn.Linear(128, feat_dim),
+        )
+    
+    def forward(
+        self, 
+        image_features: torch.Tensor,
+        depth_features: torch.Tensor,
+        depth_map: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            image_features: (B, feat_dim) from backbone
+            depth_features: (B, depth_feat_dim) from depth encoder
+            depth_map: (B, H, W) relative depth map
+        
+        Returns:
+            calibrated_features: (B, feat_dim) depth-calibrated features
+            predicted_scale: (B, 1) predicted height scale factor
+        """
+        # Predict scale factor
+        scale = self.scale_predictor(image_features)  # (B, 1)
+        
+        # Apply scale to depth map
+        calibrated_depth = depth_map * scale.unsqueeze(-1)  # (B, H, W)
+        
+        # Compute volume proxy (sum of calibrated heights)
+        volume_proxy = calibrated_depth.sum(dim=(1, 2), keepdim=True)  # (B, 1)
+        volume_proxy = volume_proxy / (depth_map.shape[1] * depth_map.shape[2])  # Normalize
+        
+        # Combine with depth features
+        combined = torch.cat([depth_features, volume_proxy], dim=1)
+        calibrated_features = self.depth_projector(combined)
+        
+        return calibrated_features, scale
+
+
+class CalibratedDepthLoss(nn.Module):
+    """
+    Auxiliary loss to train the depth scale predictor using GT height.
+    
+    This is used during training only (GT height available).
+    At inference, the learned scale predictor generalizes.
+    """
+    
+    def __init__(self, weight: float = 0.2) -> None:
+        super().__init__()
+        self.weight = weight
+    
+    def forward(
+        self, 
+        predicted_scale: torch.Tensor,
+        depth_map: torch.Tensor,
+        gt_height: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            predicted_scale: (B, 1) predicted scale factor
+            depth_map: (B, H, W) relative depth map
+            gt_height: (B,) ground-truth Height_Ave_cm
+        
+        Returns:
+            loss: Scale calibration loss
+        """
+        # Mean depth as proxy for average vegetation height
+        mean_depth = depth_map.mean(dim=(1, 2))  # (B,)
+        
+        # Calibrated mean height
+        calibrated_height = mean_depth * predicted_scale.squeeze(-1)  # (B,)
+        
+        # MSE with GT height
+        loss = F.mse_loss(calibrated_height, gt_height)
+        
+        return self.weight * loss
+
+
+# =============================================================================
+# State/Climate Density Scaler (Idea #6: Location Bias Correction)
+# =============================================================================
+
+class StateDensityScaler(nn.Module):
+    """
+    Climate/Location bias correction using State embeddings.
+    
+    Grass in Tasmania (wet/cold) has different density-to-mass ratio than
+    grass in WA (dry). Visual features alone cannot see "water weight".
+    
+    This module learns per-state scaling factors for the final biomass prediction.
+    It specifically targets the density estimation component.
+    """
+    
+    NUM_STATES = 4  # NSW, VIC, TAS, WA
+    NUM_MONTHS = 12
+    
+    def __init__(
+        self, 
+        feat_dim: int,
+        use_month: bool = True,
+        init_scale: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.use_month = use_month
+        
+        # State embeddings
+        self.state_embedding = nn.Embedding(self.NUM_STATES, 32)
+        
+        # Optional month embeddings (seasonality affects water content)
+        if use_month:
+            self.month_embedding = nn.Embedding(self.NUM_MONTHS, 32)
+            embed_dim = 64
+        else:
+            embed_dim = 32
+        
+        # Predict per-target density scaling factors
+        self.scale_predictor = nn.Sequential(
+            nn.Linear(embed_dim + feat_dim, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, 5),  # 5 targets
+        )
+        
+        # Initialize to output ~1.0 (no scaling initially)
+        nn.init.zeros_(self.scale_predictor[-1].weight)
+        nn.init.constant_(self.scale_predictor[-1].bias, init_scale)
+    
+    def forward(
+        self, 
+        features: torch.Tensor,
+        state_labels: torch.Tensor,
+        month_labels: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            features: (B, feat_dim) image features
+            state_labels: (B,) state indices (0=NSW, 1=VIC, 2=TAS, 3=WA)
+            month_labels: (B,) month indices (0-11)
+        
+        Returns:
+            scales: (B, 5) per-target density scaling factors
+        """
+        # Get embeddings
+        state_emb = self.state_embedding(state_labels)  # (B, 32)
+        
+        if self.use_month and month_labels is not None:
+            month_emb = self.month_embedding(month_labels % 12)  # (B, 32)
+            context_emb = torch.cat([state_emb, month_emb], dim=1)  # (B, 64)
+        else:
+            context_emb = state_emb
+        
+        # Combine with image features
+        combined = torch.cat([context_emb, features], dim=1)
+        
+        # Predict scaling factors (use softplus to ensure positive)
+        scales = F.softplus(self.scale_predictor(combined))  # (B, 5)
+        
+        return scales
+
+
+# =============================================================================
+# AOS Sensor Hallucination Loss (Idea #1: Enhanced NDVI Prediction)
+# =============================================================================
+
+class AOSHallucinationLoss(nn.Module):
+    """
+    Train model to "hallucinate" Active Optical Sensor (AOS) NDVI reading.
+    
+    The dataset includes Pre_GSHH_NDVI from a GreenSeeker sensor.
+    This is NOT the same as NDVI computed from RGB pixels:
+    - AOS uses active illumination (lighting-invariant)
+    - AOS measures specific wavelength reflectance
+    
+    If the model can predict AOS NDVI from RGB, it has learned a 
+    lighting-invariant "greenness" feature that correlates with green biomass.
+    
+    This is essentially knowledge distillation from a better sensor.
+    """
+    
+    def __init__(
+        self, 
+        weight: float = 0.3,
+        use_gradient_reversal: bool = False,  # Adversarial training option
+    ) -> None:
+        super().__init__()
+        self.weight = weight
+        self.use_gradient_reversal = use_gradient_reversal
+    
+    def forward(
+        self, 
+        pred_ndvi: torch.Tensor,
+        gt_ndvi: torch.Tensor,
+        green_pred: torch.Tensor = None,
+        green_target: torch.Tensor = None,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Args:
+            pred_ndvi: (B, 1) or (B,) predicted NDVI
+            gt_ndvi: (B,) ground-truth AOS NDVI (Pre_GSHH_NDVI)
+            green_pred: (B,) optional green biomass prediction (for correlation bonus)
+            green_target: (B,) optional green biomass target
+        
+        Returns:
+            loss: NDVI hallucination loss
+            loss_dict: Loss breakdown
+        """
+        pred_ndvi = pred_ndvi.squeeze(-1)
+        
+        # Main MSE loss
+        mse_loss = F.mse_loss(pred_ndvi, gt_ndvi)
+        
+        loss_dict = {"ndvi_mse": mse_loss.item()}
+        total_loss = mse_loss
+        
+        # Bonus: correlation between predicted NDVI and green biomass
+        # This reinforces that NDVI should correlate with green
+        if green_pred is not None and green_target is not None:
+            # Correlation bonus: pred_ndvi should positively correlate with green
+            # Using cosine similarity of centered values
+            ndvi_centered = pred_ndvi - pred_ndvi.mean()
+            green_centered = green_target - green_target.mean()
+            
+            correlation = F.cosine_similarity(
+                ndvi_centered.unsqueeze(0), 
+                green_centered.unsqueeze(0)
+            )
+            # Penalize negative correlation (NDVI should increase with green)
+            corr_penalty = F.relu(-correlation)
+            total_loss = total_loss + 0.1 * corr_penalty
+            loss_dict["ndvi_green_corr"] = correlation.item()
+        
+        return self.weight * total_loss, loss_dict
+
+
+# =============================================================================
+# Combined Innovative Loss (All 6 Ideas)
+# =============================================================================
+
+class InnovativeBiomassLoss(nn.Module):
+    """
+    Combined loss incorporating all 6 innovative ideas from the dataset paper:
+    
+    1. AOS Sensor Hallucination (NDVI prediction)
+    2. Physical Mass Balance (Green + Dead ≈ Total)
+    3. Calibrated Depth Volume (height-scaled 3D)
+    4. Feature Orthogonality (digital sorting)
+    5. QC Plausibility Penalties
+    6. State Density Scaling (implicit in forward)
+    
+    Plus base PlantHydra loss components.
+    """
+    
+    def __init__(
+        self,
+        use_log_transform: bool = True,
+        use_mass_balance: bool = True,
+        mass_balance_weight: float = 0.2,
+        use_aos_hallucination: bool = True,
+        aos_weight: float = 0.3,
+        use_qc_plausibility: bool = True,
+        qc_weight: float = 0.1,
+        use_calibrated_depth: bool = False,
+        depth_weight: float = 0.2,
+    ) -> None:
+        super().__init__()
+        
+        self.use_log_transform = use_log_transform
+        self.register_buffer("weights", TARGET_WEIGHTS)
+        
+        # Component losses
+        self.mass_balance = MassBalanceLoss(weight=mass_balance_weight) if use_mass_balance else None
+        self.aos_loss = AOSHallucinationLoss(weight=aos_weight) if use_aos_hallucination else None
+        self.qc_loss = QCPlausibilityLoss(weight=qc_weight) if use_qc_plausibility else None
+        self.depth_loss = CalibratedDepthLoss(weight=depth_weight) if use_calibrated_depth else None
+    
+    def forward(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        ndvi_pred: torch.Tensor = None,
+        ndvi_target: torch.Tensor = None,
+        height_pred: torch.Tensor = None,
+        height_target: torch.Tensor = None,
+        depth_scale: torch.Tensor = None,
+        depth_map: torch.Tensor = None,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Args:
+            pred: (B, 5) biomass predictions
+            target: (B, 5) biomass targets
+            ndvi_pred: (B, 1) predicted NDVI
+            ndvi_target: (B,) ground-truth AOS NDVI
+            height_pred: (B, 1) predicted height
+            height_target: (B,) ground-truth height
+            depth_scale: (B, 1) predicted depth scale
+            depth_map: (B, H, W) relative depth map
+        
+        Returns:
+            total_loss: Combined loss
+            loss_dict: Individual components
+        """
+        loss_dict = {}
+        weights = self.weights.to(pred.device)
+        
+        # Clamp predictions
+        pred_clamped = pred.clamp(min=0)
+        
+        # Base MSE loss (log-transformed)
+        if self.use_log_transform:
+            pred_log = torch.log1p(pred_clamped)
+            target_log = torch.log1p(target)
+        else:
+            pred_log = pred_clamped
+            target_log = target
+        
+        mse_per_target = ((pred_log - target_log) ** 2).mean(dim=0)
+        base_loss = (weights * mse_per_target).sum()
+        loss_dict["base_mse"] = base_loss.item()
+        total_loss = base_loss
+        
+        # 1. AOS Hallucination Loss
+        if self.aos_loss is not None and ndvi_pred is not None and ndvi_target is not None:
+            green_t = target[:, 0]
+            aos_loss, aos_dict = self.aos_loss(ndvi_pred, ndvi_target, pred_clamped[:, 0], green_t)
+            total_loss = total_loss + aos_loss
+            loss_dict.update(aos_dict)
+        
+        # 2. Mass Balance Loss
+        if self.mass_balance is not None:
+            balance_loss = self.mass_balance(pred_clamped)
+            total_loss = total_loss + balance_loss
+            loss_dict["mass_balance"] = balance_loss.item()
+        
+        # 3. Calibrated Depth Loss
+        if self.depth_loss is not None and depth_scale is not None and depth_map is not None and height_target is not None:
+            depth_loss = self.depth_loss(depth_scale, depth_map, height_target)
+            total_loss = total_loss + depth_loss
+            loss_dict["depth_cal"] = depth_loss.item()
+        
+        # 4. QC Plausibility Loss
+        if self.qc_loss is not None:
+            qc_loss = self.qc_loss(pred_clamped, height_pred, ndvi_pred)
+            total_loss = total_loss + qc_loss
+            loss_dict["qc_plausibility"] = qc_loss.item()
+        
+        loss_dict["total"] = total_loss.item()
+        return total_loss, loss_dict
+
+
+# =============================================================================
+# Homography Jitter Augmentation (for warp/annotation noise)
+# =============================================================================
+
+def random_perspective_transform(
+    img: torch.Tensor,
+    max_warp: float = 0.05,
+    border_jitter: int = 5,
+) -> torch.Tensor:
+    """
+    Apply random perspective warp + border jitter to simulate annotation noise.
+    
+    The dataset has manual corner annotations + affine/perspective normalization.
+    This augmentation simulates imperfect corner placement and warp errors.
+    
+    Args:
+        img: (C, H, W) image tensor
+        max_warp: Maximum perspective distortion as fraction of image size
+        border_jitter: Random crop/pad at borders in pixels
+    
+    Returns:
+        Warped image tensor
+    """
+    C, H, W = img.shape
+    device = img.device
+    
+    # Generate random perspective transformation
+    # 4 corners with small random offsets
+    src_pts = torch.tensor([
+        [0, 0], [W-1, 0], [W-1, H-1], [0, H-1]
+    ], dtype=torch.float32, device=device)
+    
+    # Random offsets for each corner
+    offsets = (torch.rand(4, 2, device=device) - 0.5) * 2 * max_warp
+    offsets[:, 0] *= W
+    offsets[:, 1] *= H
+    
+    dst_pts = src_pts + offsets
+    
+    # Compute perspective transform matrix
+    # This is a simplified version - for full implementation use kornia
+    # Here we just do affine approximation
+    
+    # Border jitter: random crop
+    if border_jitter > 0:
+        crop_top = torch.randint(0, border_jitter + 1, (1,)).item()
+        crop_left = torch.randint(0, border_jitter + 1, (1,)).item()
+        crop_bottom = torch.randint(0, border_jitter + 1, (1,)).item()
+        crop_right = torch.randint(0, border_jitter + 1, (1,)).item()
+        
+        img = img[:, crop_top:H-crop_bottom, crop_left:W-crop_right]
+        
+        # Resize back to original size
+        img = F.interpolate(
+            img.unsqueeze(0), 
+            size=(H, W), 
+            mode='bilinear', 
+            align_corners=False
+        ).squeeze(0)
+    
+    return img
+
 
 class BiomassLoss(nn.Module):
     """

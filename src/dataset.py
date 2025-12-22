@@ -413,13 +413,21 @@ class BiomassDataset(Dataset):
         return left_t, right_t, targets
 
 
-def get_train_transforms(img_size: int = 518, aug_prob: float = 0.5, strong: bool = False) -> A.ReplayCompose:
+def get_train_transforms(
+    img_size: int = 518, 
+    aug_prob: float = 0.5, 
+    strong: bool = False,
+    use_perspective_jitter: bool = False,
+    use_border_mask: bool = False,
+) -> A.ReplayCompose:
     """Get training augmentations with replay support for consistent stereo augmentation.
     
     Args:
         img_size: Target image size
         aug_prob: Base augmentation probability
         strong: If True, use stronger augmentations from dinov3-5tar.ipynb notebook
+        use_perspective_jitter: If True, add perspective warp to simulate annotation noise
+        use_border_mask: If True, add border masking to prevent frame-based shortcuts
     
     NOTE: This applies the SAME photometric transforms to both views (via replay),
     which may allow the model to "cheat" by matching pixel noise. For stereo-correct
@@ -430,6 +438,35 @@ def get_train_transforms(img_size: int = 518, aug_prob: float = 0.5, strong: boo
         A.HorizontalFlip(p=aug_prob),
         A.VerticalFlip(p=aug_prob),
     ]
+    
+    # Perspective jitter: simulate corner-annotation / warp noise
+    # The dataset has manual corner annotations + perspective normalization
+    # This helps the model be robust to imperfect normalization
+    if use_perspective_jitter:
+        transforms.insert(0, A.Perspective(
+            scale=(0.02, 0.08),  # Small perspective distortion
+            keep_size=True,
+            border_mode=cv2.BORDER_REFLECT_101,
+            p=0.3,
+        ))
+    
+    # Border mask: randomly mask thin borders to prevent frame-based shortcuts
+    # The dataset has metal frame artifacts that could be spurious features
+    if use_border_mask:
+        transforms.append(A.CoarseDropout(
+            num_holes_range=(1, 4),
+            hole_height_range=(0.02, 0.05),  # Thin strips
+            hole_width_range=(0.9, 1.0),  # Full width
+            fill=0,
+            p=0.2,
+        ))
+        transforms.append(A.CoarseDropout(
+            num_holes_range=(1, 4),
+            hole_height_range=(0.9, 1.0),  # Full height
+            hole_width_range=(0.02, 0.05),  # Thin strips
+            fill=0,
+            p=0.2,
+        ))
     
     if strong:
         # Strong augmentations from dinov3-5tar.ipynb
@@ -508,6 +545,33 @@ def get_train_transforms(img_size: int = 518, aug_prob: float = 0.5, strong: boo
     ])
     
     return A.ReplayCompose(transforms)
+
+
+def get_pad_to_square_transforms(img_size: int = 518) -> A.ReplayCompose:
+    """
+    Pad-to-Square transform that preserves aspect ratio.
+    
+    The quadrat images are 70cm × 30cm (7:3 aspect ratio).
+    Squashing to 1:1 destroys texture frequency (density patterns).
+    
+    This pads the image to square instead of resizing, preserving
+    the biomass density visual cues.
+    
+    Args:
+        img_size: Target square size
+    """
+    return A.ReplayCompose([
+        A.LongestMaxSize(max_size=img_size, interpolation=cv2.INTER_AREA),
+        A.PadIfNeeded(
+            min_height=img_size,
+            min_width=img_size,
+            border_mode=cv2.BORDER_CONSTANT,
+            value=0,
+            position="center",
+        ),
+        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ToTensorV2(),
+    ])
 
 
 def get_stereo_geometric_transforms(img_size: int = 518, aug_prob: float = 0.5, strong: bool = False) -> A.ReplayCompose:
@@ -694,7 +758,10 @@ def create_folds(
         seed: Random seed
         num_bins: Number of bins for target stratification (default: 4)
         cv_strategy: One of:
-            - "group_month": StratifiedGroupKFold grouped by month, stratified by Dry_Total_g bins (default)
+            - "group_location": RECOMMENDED - GroupKFold by sample_id_prefix (location+date), 
+                               stratified by State×Season×Species. Best for preventing data leakage
+                               and ensuring balanced green/dead/clover distribution across folds.
+            - "group_month": StratifiedGroupKFold grouped by month, stratified by Dry_Total_g bins
             - "group_date": StratifiedGroupKFold grouped by Sampling_Date, stratified by Dry_Total_g bins
             - "group_date_state": StratifiedGroupKFold grouped by Sampling_Date_Month, stratified by State
             - "group_date_state_bin": StratifiedGroupKFold grouped by Sampling_Date_Month, stratified by State × Dry_Total_g bin
@@ -801,6 +868,81 @@ def create_folds(
         for fold_idx, (train_idx, val_idx) in enumerate(skf.split(df, df["target_bin"])):
             df.loc[df.index[val_idx], "fold"] = fold_idx
             print(f"Fold {fold_idx}: train={len(train_idx)} -> val={len(val_idx)}")
+    
+    elif cv_strategy == "group_location":
+        # BEST STRATEGY based on dataset paper:
+        # - Group by sample_id_prefix (location + date) to prevent leakage
+        # - Stratify by State × Season × Species_group to ensure distribution balance
+        # Paper: 19 locations, 4 states, 3 years, 6 major species
+        # "manual sorting into: green, dead, clover" - species affects these ratios!
+        if "sample_id_prefix" not in df.columns:
+            print("WARNING: sample_id_prefix not found, falling back to group_date_state")
+            cv_strategy = "group_date_state"
+        elif "State" not in df.columns:
+            print("WARNING: State not found, falling back to stratified")
+            cv_strategy = "stratified"
+        else:
+            stratify_parts = [df["State"].astype(str)]
+            stratify_name = "State"
+            
+            # Add Season from month (paper spans all seasons)
+            if "Sampling_Date_Month" in df.columns:
+                month_to_season = {
+                    12: "Summer", 1: "Summer", 2: "Summer",  # Dec-Feb (Southern Hemisphere)
+                    3: "Autumn", 4: "Autumn", 5: "Autumn",   # Mar-May
+                    6: "Winter", 7: "Winter", 8: "Winter",   # Jun-Aug
+                    9: "Spring", 10: "Spring", 11: "Spring"  # Sep-Nov
+                }
+                df["_Season"] = df["Sampling_Date_Month"].astype(int).map(month_to_season)
+                stratify_parts.append(df["_Season"].astype(str))
+                stratify_name += "×Season"
+            
+            # Add Species group (paper: "Species: Pasture species by biomass")
+            # Different species have very different green/dead/clover ratios
+            if "Species" in df.columns:
+                # Simplify species to major groups to avoid too many strata
+                species_to_group = {
+                    "Clover": "Clover", "WhiteClover": "Clover", 
+                    "SubcloverLosa": "Clover", "SubcloverDalkeith": "Clover",
+                    "Ryegrass": "Ryegrass", "Ryegrass_Clover": "Ryegrass",
+                    "Phalaris": "Phalaris", "Phalaris_Clover": "Phalaris",
+                    "Phalaris_Ryegrass_Clover": "Phalaris",
+                    "Fescue": "Other", "Fescue_CrumbWeed": "Other",
+                    "Lucerne": "Other",
+                }
+                df["_SpeciesGroup"] = df["Species"].map(lambda x: species_to_group.get(x, "Other"))
+                stratify_parts.append(df["_SpeciesGroup"].astype(str))
+                stratify_name += "×Species"
+            
+            # Combine stratification columns
+            stratify_col = stratify_parts[0]
+            for part in stratify_parts[1:]:
+                stratify_col = stratify_col + "_" + part
+            
+            n_groups = df["sample_id_prefix"].nunique()
+            n_strata = stratify_col.nunique()
+            print(f"\nUsing StratifiedGroupKFold (group=sample_id_prefix, stratify={stratify_name})")
+            print(f"Found {n_groups} unique location+date groups, {n_strata} strata")
+            
+            sgkf = StratifiedGroupKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+            
+            for fold_idx, (train_idx, val_idx) in enumerate(
+                sgkf.split(df, stratify_col, groups=df["sample_id_prefix"])
+            ):
+                df.loc[df.index[val_idx], "fold"] = fold_idx
+                
+                train_states = df.iloc[train_idx]["State"].value_counts().to_dict()
+                val_states = df.iloc[val_idx]["State"].value_counts().to_dict()
+                train_groups = df.iloc[train_idx]["sample_id_prefix"].nunique()
+                val_groups = df.iloc[val_idx]["sample_id_prefix"].nunique()
+                print(
+                    f"Fold {fold_idx}: train={len(train_idx)} ({train_groups} groups) -> "
+                    f"val={len(val_idx)} ({val_groups} groups) | "
+                    f"States: train={train_states} val={val_states}"
+                )
+            
+            # Cleanup temp columns
+            df = df.drop(columns=["_Season", "_SpeciesGroup"], errors="ignore")
     
     elif cv_strategy == "random":
         # Standard random KFold (no stratification)
