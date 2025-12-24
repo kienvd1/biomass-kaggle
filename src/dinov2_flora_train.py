@@ -216,7 +216,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-csv", type=str, default="data/train.csv")
     parser.add_argument("--image-dir", type=str, default="data/train")
     parser.add_argument("--output-dir", type=str, default="outputs/dinov2_flora")
-    parser.add_argument("--fold-csv", type=str, default="data/trainfold.csv",
+    parser.add_argument("--fold-csv", type=str, default="data/default_folds.csv",
                         help="Path to predefined folds CSV (with sample_id_prefix, fold columns)")
     
     # Model

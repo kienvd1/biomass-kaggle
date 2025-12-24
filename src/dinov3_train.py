@@ -32,7 +32,7 @@ import json
 import os
 import random
 from datetime import datetime
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -92,6 +92,73 @@ from .dinov3_models import (
 # Image sizes by backbone type
 IMG_SIZE_DINOV3 = 576  # For grid 3x3 (672/3 = 224px per tile)
 IMG_SIZE_DINOV2 = 518  # Native DINOv2 resolution (518/14 = 37 patches)
+
+# Competition weights for weighted MSE
+COMPETITION_WEIGHTS = [0.1, 0.1, 0.1, 0.2, 0.5]  # [green, dead, clover, gdm, total]
+
+
+def compute_weighted_mse(
+    preds: torch.Tensor, 
+    targets: torch.Tensor,
+    weights: list[float] = COMPETITION_WEIGHTS,
+) -> tuple[float, dict[str, float]]:
+    """
+    Compute competition-weighted MSE.
+    
+    Args:
+        preds: Predictions (N, 5) - [green, dead, clover, gdm, total]
+        targets: Ground truth (N, 5)
+        weights: Competition weights [0.1, 0.1, 0.1, 0.2, 0.5]
+    
+    Returns:
+        weighted_mse: Weighted sum of per-target MSE
+        per_target_mse: Dict with MSE for each target
+    """
+    target_names = ["green", "dead", "clover", "gdm", "total"]
+    per_target_mse = {}
+    weighted_mse = 0.0
+    
+    for i, name in enumerate(target_names):
+        pred_i = preds[:, i]
+        target_i = targets[:, i]
+        mse_i = ((pred_i - target_i) ** 2).mean().item()
+        per_target_mse[f"mse_{name}"] = mse_i
+        weighted_mse += weights[i] * mse_i
+    
+    per_target_mse["weighted_mse"] = weighted_mse
+    return weighted_mse, per_target_mse
+
+
+def compute_weighted_l1(
+    preds: torch.Tensor, 
+    targets: torch.Tensor,
+    weights: list[float] = COMPETITION_WEIGHTS,
+) -> tuple[float, dict[str, float]]:
+    """
+    Compute competition-weighted L1 (MAE).
+    
+    Args:
+        preds: Predictions (N, 5) - [green, dead, clover, gdm, total]
+        targets: Ground truth (N, 5)
+        weights: Competition weights [0.1, 0.1, 0.1, 0.2, 0.5]
+    
+    Returns:
+        weighted_l1: Weighted sum of per-target L1
+        per_target_l1: Dict with L1 for each target
+    """
+    target_names = ["green", "dead", "clover", "gdm", "total"]
+    per_target_l1: dict[str, float] = {}
+    weighted_l1 = 0.0
+    
+    for i, name in enumerate(target_names):
+        pred_i = preds[:, i]
+        target_i = targets[:, i]
+        l1_i = (pred_i - target_i).abs().mean().item()
+        per_target_l1[f"l1_{name}"] = l1_i
+        weighted_l1 += weights[i] * l1_i
+    
+    per_target_l1["weighted_l1"] = weighted_l1
+    return weighted_l1, per_target_l1
 
 
 # =============================================================================
@@ -545,6 +612,14 @@ def validate(
             r2_i = 1 - (ss_res / (ss_tot + 1e-8))
             metrics[f"r2_{name}_log"] = float(r2_i.item())
     
+    # Compute weighted MSE (always, for model selection)
+    weighted_mse, mse_metrics = compute_weighted_mse(all_preds_t, all_targets_t)
+    metrics.update(mse_metrics)
+    
+    # Compute weighted L1 (for model selection)
+    weighted_l1, l1_metrics = compute_weighted_l1(all_preds_t, all_targets_t)
+    metrics.update(l1_metrics)
+    
     # Sync MPS before returning
     if device_type == DeviceType.MPS:
         torch.mps.synchronize()
@@ -943,18 +1018,33 @@ def train_fold(
     
     # Training loop
     best_r2 = -float("inf")
+    best_loss = float("inf")
     best_metrics: Dict[str, float] = {}
     patience_counter = 0
     best_epoch = 0
+    best_mse = float("inf")  # Track weighted MSE (lower is better)
+    best_l1 = float("inf")   # Track weighted L1/MAE (lower is better)
+    
+    # Best metric selection: r2, loss, mse, or l1
+    best_metric = getattr(cfg, 'best_metric', 'r2')
+    use_loss_metric = best_metric == 'loss'
+    use_mse_metric = best_metric == 'mse'
+    use_l1_metric = best_metric == 'l1'
     
     # Stage-specific tracking for two-stage training
     stage1_best_r2 = -float("inf")
+    stage1_best_loss = float("inf")
     stage1_best_epoch = 0
     stage2_epoch_offset = 0  # Track total epochs when Stage 2 starts
     
     # Temp paths for checkpoints
     temp_ckpt_path = os.path.join(cfg.output_dir, f"_temp_fold{fold}.pth") if cfg.output_dir else None
     stage1_ckpt_path = os.path.join(cfg.output_dir, f"_stage1_fold{fold}.pth") if cfg.output_dir else None
+    
+    # Top-K checkpoint tracking: list of (metric_value, epoch, temp_path)
+    # For r2: higher is better, for loss/mse: lower is better
+    save_top_k = getattr(cfg, 'save_top_k', 1)
+    top_k_checkpoints: List[Tuple[float, int, str]] = []  # (metric, epoch, path)
     
     # Determine patience for current stage
     if cfg.two_stage:
@@ -999,7 +1089,15 @@ def train_fold(
                 if patience_counter >= current_patience:
                     should_transition = True
                     if is_main_process():
-                        print(f"\n>>> Stage 1 converged (best epoch: {stage1_best_epoch}, aR²={stage1_best_r2:.4f})")
+                        if use_l1_metric:
+                            s1_metric = f"wL1={best_l1:.4f}"
+                        elif use_mse_metric:
+                            s1_metric = f"wMSE={best_mse:.4f}"
+                        elif use_loss_metric:
+                            s1_metric = f"Loss={stage1_best_loss:.4f}"
+                        else:
+                            s1_metric = f"R²={stage1_best_r2:.4f}"
+                        print(f"\n>>> Stage 1 converged (best epoch: {stage1_best_epoch}, {s1_metric})")
             else:
                 # Epoch-based: transition at fixed epoch
                 if epoch == cfg.freeze_epochs + 1:
@@ -1023,7 +1121,15 @@ def train_fold(
                     print(f">>> Loading best Stage 1 checkpoint (epoch {stage1_best_epoch})")
                 model.load_state_dict(torch.load(stage1_ckpt_path, map_location=device, weights_only=True))
             
-            unfreeze_backbone(model)
+            # Unfreeze backbone (optionally only last N blocks)
+            train_blocks = getattr(cfg, 'train_blocks', None)
+            unfreeze_backbone(model, train_blocks=train_blocks)
+            
+            if is_main_process():
+                if train_blocks:
+                    print(f">>> Stage 2: Training last {train_blocks} transformer blocks")
+                else:
+                    print(f">>> Stage 2: Training all backbone layers")
             
             # Use layer-wise LR if lr_mult < 1.0
             if lr_mult < 1.0:
@@ -1080,23 +1186,73 @@ def train_fold(
             mem_info = ""
         
         improved = ""
-        if r2 > best_r2 and not np.isnan(r2):
+        # Get current weighted MSE and L1 from metrics
+        current_mse = metrics.get("weighted_mse", float("inf"))
+        current_l1 = metrics.get("weighted_l1", float("inf"))
+        
+        # Determine if this is the best model based on selected metric
+        if use_l1_metric:
+            is_better = current_l1 < best_l1 and not np.isnan(current_l1)
+        elif use_mse_metric:
+            is_better = current_mse < best_mse and not np.isnan(current_mse)
+        elif use_loss_metric:
+            is_better = val_loss < best_loss and not np.isnan(val_loss)
+        else:  # r2
+            is_better = r2 > best_r2 and not np.isnan(r2)
+        
+        if is_better:
             best_r2 = r2
+            best_loss = val_loss
+            best_mse = current_mse
+            best_l1 = current_l1
             best_metrics = metrics.copy()
             best_epoch = epoch
             patience_counter = 0
             improved = " *"
-            # Save best checkpoint (only on main process to avoid race)
-            if temp_ckpt_path and is_main_process():
-                torch.save(model.state_dict(), temp_ckpt_path)
             # Also save as Stage 1 best if in Stage 1
             if cfg.two_stage and stage == 1:
                 stage1_best_r2 = r2
+                stage1_best_loss = val_loss
                 stage1_best_epoch = epoch
                 if stage1_ckpt_path and is_main_process():
                     torch.save(model.state_dict(), stage1_ckpt_path)
         else:
             patience_counter += 1
+        
+        # Top-K checkpoint saving (independent of best tracking)
+        if cfg.output_dir and is_main_process() and save_top_k > 0:
+            # Determine metric value (for r2: negate so lower=better for sorting)
+            if use_l1_metric:
+                metric_val = current_l1
+            elif use_mse_metric:
+                metric_val = current_mse
+            elif use_loss_metric:
+                metric_val = val_loss
+            else:  # r2
+                metric_val = -r2  # Negate so lower is better
+            
+            # Check if this should be in top-K
+            should_save = len(top_k_checkpoints) < save_top_k
+            if not should_save and top_k_checkpoints:
+                # Check if better than worst in top-K (worst = highest metric_val)
+                worst_metric = max(ckpt[0] for ckpt in top_k_checkpoints)
+                should_save = metric_val < worst_metric and not np.isnan(metric_val)
+            
+            if should_save and not np.isnan(metric_val):
+                # Save checkpoint
+                ckpt_path = os.path.join(cfg.output_dir, f"_topk_fold{fold}_ep{epoch}.pth")
+                torch.save(model.state_dict(), ckpt_path)
+                top_k_checkpoints.append((metric_val, epoch, ckpt_path))
+                
+                # Remove worst if exceeding K
+                if len(top_k_checkpoints) > save_top_k:
+                    # Sort by metric (lower is better), remove worst
+                    top_k_checkpoints.sort(key=lambda x: x[0])
+                    worst = top_k_checkpoints.pop()
+                    try:
+                        os.remove(worst[2])
+                    except FileNotFoundError:
+                        pass
         
         # Per-target R²
         per_target = " | ".join([
@@ -1123,7 +1279,12 @@ def train_fold(
         
         # Only print on main process to avoid interleaved output
         if is_main_process():
-            print(f"  {stage_info}Ep {epoch:02d}: loss={train_loss:.4f}/{val_loss:.4f}{loss_breakdown_str} R²={r2:.4f} [{per_target}]{mem_info}{improved}", flush=True)
+            metric_str = ""
+            if use_mse_metric:
+                metric_str = f" wMSE={current_mse:.4f}"
+            elif use_l1_metric:
+                metric_str = f" wL1={current_l1:.4f}"
+            print(f"  {stage_info}Ep {epoch:02d}: loss={train_loss:.4f}/{val_loss:.4f}{loss_breakdown_str} R²={r2:.4f}{metric_str} [{per_target}]{mem_info}{improved}", flush=True)
         
         # Early stopping
         if np.isnan(train_loss) or np.isnan(val_loss):
@@ -1152,14 +1313,36 @@ def train_fold(
         except FileNotFoundError:
             pass
     
-    # Rename temp checkpoint to final name (only on main process)
-    if temp_ckpt_path and is_main_process():
-        save_path = os.path.join(cfg.output_dir, f"dinov3_best_fold{fold}.pth")
-        try:
-            os.rename(temp_ckpt_path, save_path)
-            print(f"  Saved: {save_path} (best epoch: {best_epoch}, R²={best_r2:.4f})")
-        except FileNotFoundError:
-            pass
+    # Rename top-K checkpoints to final names (only on main process)
+    if cfg.output_dir and is_main_process() and top_k_checkpoints:
+        # Sort by metric (lower is better after negation for r2)
+        top_k_checkpoints.sort(key=lambda x: x[0])
+        
+        if use_l1_metric:
+            metric_name = "wL1"
+        elif use_mse_metric:
+            metric_name = "wMSE"
+        elif use_loss_metric:
+            metric_name = "Loss"
+        else:
+            metric_name = "R²"
+        
+        for rank, (metric_val, ep, temp_path) in enumerate(top_k_checkpoints):
+            # Convert back from negated for display if r2 (only r2 is negated)
+            display_val = -metric_val if not (use_mse_metric or use_loss_metric or use_l1_metric) else metric_val
+            
+            if rank == 0:
+                # Best checkpoint gets the standard name
+                save_path = os.path.join(cfg.output_dir, f"dinov3_best_fold{fold}.pth")
+            else:
+                # Others get ranked names
+                save_path = os.path.join(cfg.output_dir, f"dinov3_top{rank+1}_fold{fold}.pth")
+            
+            try:
+                os.rename(temp_path, save_path)
+                print(f"  Saved: {save_path} (epoch {ep}, {metric_name}={display_val:.4f})")
+            except FileNotFoundError:
+                pass
     
     # Cleanup
     del model, optimizer, scheduler
@@ -1169,6 +1352,10 @@ def train_fold(
     return {
         "fold": fold,
         "best_r2": best_r2,
+        "best_loss": best_loss,
+        "best_mse": best_mse,
+        "best_l1": best_l1,
+        "best_epoch": best_epoch,
         "metrics": best_metrics,
     }
 
@@ -1178,7 +1365,7 @@ def main() -> None:
     
     # Data
     parser.add_argument("--base-path", type=str, default="./data")
-    parser.add_argument("--fold-csv", type=str, default="data/trainfold_group_month_species.csv",
+    parser.add_argument("--fold-csv", type=str, default="data/default_folds.csv",
                         help="Path to CSV with predefined folds (sample_id_prefix, fold)")
     parser.add_argument("--use-predefined-folds", action="store_true", default=True,
                         help="Use predefined folds from --fold-csv (default: True)")
@@ -1354,6 +1541,14 @@ def main() -> None:
     parser.add_argument("--warmup-epochs", type=int, default=3)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--patience", type=int, default=10)
+    parser.add_argument("--best-metric", type=str, default="r2", choices=["loss", "r2", "mse", "l1"],
+                        help="Metric for best model selection: 'loss', 'r2' (default), 'mse' (weighted MSE), or 'l1' (weighted MAE). Lower is better except r2.")
+    parser.add_argument("--save-top-k", type=int, default=1,
+                        help="Save top K best checkpoints (default: 1, only best)")
+    parser.add_argument("--train-all", action="store_true",
+                        help="Train on ALL data (no CV split). Computes weighted MSE on training data for model selection.")
+    parser.add_argument("--train-blocks", type=int, default=None,
+                        help="Number of last transformer blocks to train in Stage 2 (default: all blocks)")
     
     # Augmentation
     parser.add_argument("--aug-prob", type=float, default=0.5)
@@ -1615,6 +1810,8 @@ def main() -> None:
     else:
         print(f"Loss: MSE on 5 targets (G=0.1, D=0.1, C=0.1, GDM=0.2, T=0.5)")
     print(f"Epochs: {args.epochs} | Patience: {args.patience}")
+    train_mode = "TRAIN-ALL (no CV)" if args.train_all else "CV"
+    print(f"Best metric: {args.best_metric} | Train blocks: {args.train_blocks or 'all'} | Mode: {train_mode}")
     print(f"Output: {args.output_dir}")
     print("=" * 60)
     
@@ -1639,64 +1836,111 @@ def main() -> None:
         print(f"Creating folds with {args.cv_strategy} strategy")
         df = create_folds(df, n_folds=args.n_folds, seed=args.seed, cv_strategy=args.cv_strategy)
     
-    # Save fold info
-    fold_df = df[["sample_id_prefix", "fold"]].drop_duplicates()
-    fold_df.to_csv(os.path.join(args.output_dir, "folds.csv"), index=False)
-    
-    print(f"Total samples: {len(df)}")
-    print(f"Fold distribution:\n{df['fold'].value_counts().sort_index()}")
-    
-    # Train folds
-    folds_to_train = args.folds if args.folds else list(range(args.n_folds))
-    results = []
     results_path = os.path.join(args.output_dir, "results.json")
+    results = []
     
-    # Save initial config before training starts
-    with open(results_path, "w") as f:
-        json.dump({
-            "status": "training",
-            "cv_aR2_mean": None,
-            "cv_aR2_std": None,
-            "cv_gR2_mean": None,
-            "cv_gR2_std": None,
-            "folds": [],
-            "config": vars(args),
-        }, f, indent=2, default=str)
-    print(f"Config saved to: {results_path}")
-    
-    for fold in folds_to_train:
-        train_df = df[df["fold"] != fold].reset_index(drop=True)
-        valid_df = df[df["fold"] == fold].reset_index(drop=True)
+    # Train-all mode: train on ALL data, use same data for validation (model selection)
+    if args.train_all:
+        print(f"\n{'='*60}")
+        print("TRAIN-ALL MODE: Training on ALL data")
+        print(f"Model selection metric: weighted MSE (lower is better)")
+        print(f"{'='*60}")
+        print(f"Total samples: {len(df)}")
         
-        fold_result = train_fold(fold, train_df, valid_df, args, device, device_type, img_size)
-        results.append(fold_result)
-        
-        # Save results after each fold
-        avg_r2_scores = [r["best_r2"] for r in results]
-        
+        # Save initial config
         with open(results_path, "w") as f:
             json.dump({
-                "status": "training" if len(results) < len(folds_to_train) else "complete",
-                "cv_R2_mean": float(np.mean(avg_r2_scores)),
-                "cv_R2_std": float(np.std(avg_r2_scores)) if len(results) > 1 else 0.0,
+                "status": "training",
+                "mode": "train_all",
+                "folds": [],
+                "config": vars(args),
+            }, f, indent=2, default=str)
+        
+        # Train on all data, validate on all data (for model selection only)
+        fold_result = train_fold(0, df, df, args, device, device_type, img_size)
+        results.append(fold_result)
+        
+        # Save results
+        with open(results_path, "w") as f:
+            json.dump({
+                "status": "complete",
+                "mode": "train_all",
+                "best_r2": fold_result["best_r2"],
+                "best_mse": fold_result["best_mse"],
+                "best_l1": fold_result["best_l1"],
+                "best_loss": fold_result["best_loss"],
+                "best_epoch": fold_result["best_epoch"],
+                "metrics": fold_result["metrics"],
                 "folds": results,
                 "config": vars(args),
             }, f, indent=2, default=str)
-        print(f"  Results updated: {results_path} ({len(results)}/{len(folds_to_train)} folds)")
-    
-    # Summary
-    print("\n" + "=" * 60)
-    print("Training Complete!")
-    print("=" * 60)
-    
-    avg_r2_scores = [r["best_r2"] for r in results]
-    print(f"Mean CV R²: {np.mean(avg_r2_scores):.4f} ± {np.std(avg_r2_scores):.4f}")
-    
-    for r in results:
-        m = r["metrics"]
-        print(f"  Fold {r['fold']}: R²={r['best_r2']:.4f} "
-              f"[G={m['r2_green']:.3f} D={m['r2_dead']:.3f} C={m['r2_clover']:.3f} "
+        
+        # Summary
+        print("\n" + "=" * 60)
+        print("Training Complete! (TRAIN-ALL MODE)")
+        print("=" * 60)
+        m = fold_result["metrics"]
+        print(f"  R²={fold_result['best_r2']:.4f} | wMSE={fold_result['best_mse']:.4f} | wL1={fold_result['best_l1']:.4f}")
+        print(f"  [G={m['r2_green']:.3f} D={m['r2_dead']:.3f} C={m['r2_clover']:.3f} "
               f"GDM={m['r2_gdm']:.3f} T={m['r2_total']:.3f}]")
+    else:
+        # Standard CV mode
+        # Save fold info
+        fold_df = df[["sample_id_prefix", "fold"]].drop_duplicates()
+        fold_df.to_csv(os.path.join(args.output_dir, "folds.csv"), index=False)
+        
+        print(f"Total samples: {len(df)}")
+        print(f"Fold distribution:\n{df['fold'].value_counts().sort_index()}")
+        
+        # Train folds
+        folds_to_train = args.folds if args.folds else list(range(args.n_folds))
+        
+        # Save initial config before training starts
+        with open(results_path, "w") as f:
+            json.dump({
+                "status": "training",
+                "cv_aR2_mean": None,
+                "cv_aR2_std": None,
+                "cv_gR2_mean": None,
+                "cv_gR2_std": None,
+                "folds": [],
+                "config": vars(args),
+            }, f, indent=2, default=str)
+        print(f"Config saved to: {results_path}")
+        
+        for fold in folds_to_train:
+            train_df = df[df["fold"] != fold].reset_index(drop=True)
+            valid_df = df[df["fold"] == fold].reset_index(drop=True)
+            
+            fold_result = train_fold(fold, train_df, valid_df, args, device, device_type, img_size)
+            results.append(fold_result)
+            
+            # Save results after each fold
+            avg_r2_scores = [r["best_r2"] for r in results]
+            
+            with open(results_path, "w") as f:
+                json.dump({
+                    "status": "training" if len(results) < len(folds_to_train) else "complete",
+                    "cv_R2_mean": float(np.mean(avg_r2_scores)),
+                    "cv_R2_std": float(np.std(avg_r2_scores)) if len(results) > 1 else 0.0,
+                    "folds": results,
+                    "config": vars(args),
+                }, f, indent=2, default=str)
+            print(f"  Results updated: {results_path} ({len(results)}/{len(folds_to_train)} folds)")
+        
+        # Summary
+        print("\n" + "=" * 60)
+        print("Training Complete!")
+        print("=" * 60)
+        
+        avg_r2_scores = [r["best_r2"] for r in results]
+        print(f"Mean CV R²: {np.mean(avg_r2_scores):.4f} ± {np.std(avg_r2_scores):.4f}")
+        
+        for r in results:
+            m = r["metrics"]
+            print(f"  Fold {r['fold']}: R²={r['best_r2']:.4f} "
+                  f"[G={m['r2_green']:.3f} D={m['r2_dead']:.3f} C={m['r2_clover']:.3f} "
+                  f"GDM={m['r2_gdm']:.3f} T={m['r2_total']:.3f}]")
     
     # Save Depth Anything model separately for Kaggle (if depth features used)
     if is_main_process() and (args.use_depth or args.depth_attention):

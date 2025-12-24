@@ -750,8 +750,8 @@ def main() -> None:
     parser.add_argument("--backbone", type=str, default="vit_base_patch14_reg4_dinov2.lvd142m",
                         help="Vision backbone: DINOv2 (vit_base_patch14_reg4_dinov2.lvd142m) or "
                              "DINOv3 (vit_base_patch16_dinov3, vit_large_patch16_dinov3)")
-    parser.add_argument("--fold-csv", type=str, default="./data/trainfold.csv",
-                        help="Path to CSV with predefined folds (default: ./data/trainfold.csv)")
+    parser.add_argument("--fold-csv", type=str, default="data/default_folds.csv",
+                        help="Path to CSV with predefined folds (default: data/default_folds.csv)")
     parser.add_argument("--n-trials", type=int, default=50)
     parser.add_argument("--max-epochs", type=int, default=50)
     parser.add_argument("--patience", type=int, default=10)

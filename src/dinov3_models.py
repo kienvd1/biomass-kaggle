@@ -3187,11 +3187,45 @@ def freeze_backbone(model: DINOv3Direct) -> None:
             param.requires_grad = False
 
 
-def unfreeze_backbone(model: DINOv3Direct) -> None:
-    """Unfreeze backbone parameters."""
-    for name, param in model.named_parameters():
-        if "backbone" in name:
-            param.requires_grad = True
+def unfreeze_backbone(model: DINOv3Direct, train_blocks: Optional[int] = None) -> None:
+    """
+    Unfreeze backbone parameters.
+    
+    Args:
+        model: Model with backbone
+        train_blocks: If specified, only unfreeze the last N transformer blocks.
+                     If None, unfreeze all backbone parameters.
+    """
+    if train_blocks is None:
+        # Unfreeze all backbone
+        for name, param in model.named_parameters():
+            if "backbone" in name:
+                param.requires_grad = True
+    else:
+        # Partial unfreeze: only last N blocks
+        if hasattr(model, 'backbone') and hasattr(model.backbone, 'blocks'):
+            num_blocks = len(model.backbone.blocks)
+            freeze_until = num_blocks - train_blocks
+            
+            # Freeze early blocks
+            for i, block in enumerate(model.backbone.blocks):
+                for p in block.parameters():
+                    p.requires_grad = i >= freeze_until
+            
+            # Keep patch_embed, cls_token, pos_embed frozen (early layers)
+            for name, param in model.backbone.named_parameters():
+                if 'blocks' not in name:
+                    param.requires_grad = False
+            
+            # Unfreeze final norm layer
+            if hasattr(model.backbone, 'norm'):
+                for p in model.backbone.norm.parameters():
+                    p.requires_grad = True
+        else:
+            # Fallback: unfreeze all
+            for name, param in model.named_parameters():
+                if "backbone" in name:
+                    param.requires_grad = True
 
 
 def count_parameters(model: nn.Module, trainable_only: bool = True) -> int:

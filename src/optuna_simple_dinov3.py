@@ -531,7 +531,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Optuna Search for Simple DINOv3")
 
     parser.add_argument("--base-path", type=str, default="./data")
-    parser.add_argument("--fold-csv", type=str, default="data/trainfold_group_month_species.csv")
+    parser.add_argument("--fold-csv", type=str, default="data/default_folds.csv")
     parser.add_argument("--n-trials", type=int, default=40)
     parser.add_argument("--max-epochs", type=int, default=50)
     parser.add_argument("--patience", type=int, default=10)
