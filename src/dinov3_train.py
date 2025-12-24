@@ -343,6 +343,7 @@ def train_one_epoch(
     use_ndvi_head: bool = False,
     use_height_head: bool = False,
     use_species_head: bool = False,
+    use_composition_head: bool = False,
     use_planthydra: bool = False,
     use_state_head: bool = False,
 ) -> Tuple[float, Dict[str, float]]:
@@ -361,19 +362,22 @@ def train_one_epoch(
         x_left, x_right, targets = batch[:3]
         
         # Get auxiliary labels from batch
+        # Batch format: [x_left, x_right, targets, state, month, species, composition, ndvi, height]
         state_labels = None
         month_labels = None
         species_labels = None
+        composition_labels = None
         ndvi_target = None
         height_target = None
         
-        if len(batch) >= 6:
+        if len(batch) >= 7:
             state_labels = batch[3].to(device, non_blocking=True)
             month_labels = batch[4].to(device, non_blocking=True)
             species_labels = batch[5].to(device, non_blocking=True)
-        if len(batch) >= 8:
-            ndvi_target = batch[6].to(device, non_blocking=True)
-            height_target = batch[7].to(device, non_blocking=True)
+            composition_labels = batch[6].to(device, non_blocking=True)
+        if len(batch) >= 9:
+            ndvi_target = batch[7].to(device, non_blocking=True)
+            height_target = batch[8].to(device, non_blocking=True)
         
         # Use channels_last for MPS performance
         if use_channels_last:
@@ -392,12 +396,13 @@ def train_one_epoch(
             outputs = model(x_left, x_right)
             green, dead, clover, gdm, total, aux_loss = outputs[:6]
             
-            # Get optional outputs
+            # Get optional outputs (model returns at positions 6-11)
             dead_presence_logit = outputs[6] if len(outputs) > 6 else None
             clover_presence_logit = outputs[7] if len(outputs) > 7 else None
             ndvi_pred = outputs[8] if len(outputs) > 8 else None
             height_pred = outputs[9] if len(outputs) > 9 else None
             species_logits = outputs[10] if len(outputs) > 10 else None
+            composition_logits = outputs[11] if len(outputs) > 11 else None
             
             preds = torch.cat([green, dead, clover, gdm, total], dim=1)
             
@@ -412,6 +417,8 @@ def train_one_epoch(
                 species_labels=species_labels if use_species_head else None,
                 state_logits=None,  # TODO: Add state head to model if needed
                 state_labels=state_labels if use_state_head else None,
+                composition_logits=composition_logits,
+                composition_labels=composition_labels if use_composition_head else None,
             )
             loss = loss + aux_loss
             
@@ -425,8 +432,8 @@ def train_one_epoch(
             preds = torch.cat([green, dead, clover, gdm, total], dim=1)
             loss, _ = loss_fn(preds, targets, state_logits, state_labels, month_logits, month_labels, species_logits, species_labels)
             loss = loss + aux_loss
-        elif use_presence_heads or use_ndvi_head or use_height_head or use_species_head:
-            # Model returns: green, dead, clover, gdm, total, aux_loss, dead_presence_logit, clover_presence_logit, ndvi_pred, height_pred, species_logits
+        elif use_presence_heads or use_ndvi_head or use_height_head or use_species_head or use_composition_head:
+            # Model returns: green, dead, clover, gdm, total, aux_loss, dead_presence, clover_presence, ndvi, height, species, composition
             outputs = model(x_left, x_right)
             green, dead, clover, gdm, total, aux_loss = outputs[:6]
             dead_presence_logit = outputs[6] if len(outputs) > 6 else None
@@ -434,6 +441,7 @@ def train_one_epoch(
             ndvi_pred = outputs[8] if len(outputs) > 8 else None
             height_pred = outputs[9] if len(outputs) > 9 else None
             species_logits_out = outputs[10] if len(outputs) > 10 else None
+            composition_logits_out = outputs[11] if len(outputs) > 11 else None
             
             preds = torch.cat([green, dead, clover, gdm, total], dim=1)
             
@@ -447,6 +455,8 @@ def train_one_epoch(
                 height_target=height_target if use_height_head else None,
                 species_logits=species_logits_out,
                 species_labels=species_labels if use_species_head else None,
+                composition_logits=composition_logits_out,
+                composition_labels=composition_labels if use_composition_head else None,
             )
             loss = loss + aux_loss
             
@@ -666,12 +676,16 @@ def train_fold(
     no_lighting = getattr(cfg, 'no_lighting', False)
     use_perspective_jitter = getattr(cfg, 'use_perspective_jitter', False)
     use_border_mask = getattr(cfg, 'use_border_mask', False)
+    use_season_aug = getattr(cfg, 'use_season_aug', False)
+    season_aug_prob = getattr(cfg, 'season_aug_prob', 0.5)
     
     if is_main_process():
         if strong_aug:
             print("Augmentation: STRONG (from dinov3-5tar.ipynb)")
         if no_lighting:
             print("Augmentation: NO LIGHTING (ColorJitter, HSV, Brightness, CLAHE removed)")
+        if use_season_aug:
+            print(f"Augmentation: SEASON AUG (p={season_aug_prob}) - for cross-season generalization")
         if use_perspective_jitter:
             print("Augmentation: +Perspective jitter (annotation noise sim)")
         if use_border_mask:
@@ -682,7 +696,9 @@ def train_fold(
         train_transform = get_train_transforms(
             img_size, cfg.aug_prob, strong=strong_aug, no_lighting=no_lighting,
             use_perspective_jitter=use_perspective_jitter, 
-            use_border_mask=use_border_mask
+            use_border_mask=use_border_mask,
+            use_season_aug=use_season_aug,
+            season_aug_prob=season_aug_prob,
         )
         photometric_transform = None
         photometric_left_only = False
@@ -726,9 +742,10 @@ def train_fold(
     
     # Datasets
     use_aux_heads = getattr(cfg, 'use_aux_heads', False)
-    # Need aux labels if using aux heads OR NDVI/Height/Species heads (for ground-truth targets)
+    # Need aux labels if using aux heads OR NDVI/Height/Species/Composition heads (for ground-truth targets)
     need_aux_labels = (use_aux_heads or getattr(cfg, 'use_ndvi_head', False) or 
-                       getattr(cfg, 'use_height_head', False) or getattr(cfg, 'use_species_head', False))
+                       getattr(cfg, 'use_height_head', False) or getattr(cfg, 'use_species_head', False) or
+                       getattr(cfg, 'use_composition_head', False))
     mix_same_context = not getattr(cfg, 'no_mix_same_context', False)
     train_ds = BiomassDataset(
         train_df, cfg.image_dir, train_transform,
@@ -821,6 +838,7 @@ def train_fold(
         use_ndvi_head=cfg.use_ndvi_head,
         use_height_head=cfg.use_height_head,
         use_species_head=cfg.use_species_head,
+        use_composition_head=getattr(cfg, 'use_composition_head', False),
     ).to(device)
     
     # Use channels_last memory format for MPS (faster convolutions)
@@ -841,6 +859,7 @@ def train_fold(
     use_ndvi = getattr(cfg, 'use_ndvi_head', False)
     use_height = getattr(cfg, 'use_height_head', False)
     use_species = getattr(cfg, 'use_species_head', False)
+    use_composition = getattr(cfg, 'use_composition_head', False)
     use_tweedie = getattr(cfg, 'use_tweedie', False)
     use_planthydra = getattr(cfg, 'use_planthydra_loss', False)
     use_log_transform = getattr(cfg, 'use_log_transform', False)
@@ -868,6 +887,8 @@ def train_fold(
             species_weight=getattr(cfg, 'aux_species_weight', 0.1),
             use_state_aux=use_state_head,
             state_weight=getattr(cfg, 'state_weight', 0.1),
+            use_composition_aux=use_composition,
+            composition_weight=getattr(cfg, 'composition_weight', 0.15),
             train_dead=cfg.train_dead,
             train_clover=cfg.train_clover,
         )
@@ -886,6 +907,8 @@ def train_fold(
             extras_loss.append(f"NDVI(w={cfg.ndvi_weight:.1f})")
         if use_species:
             extras_loss.append(f"Species(w={cfg.aux_species_weight:.1f})")
+        if use_composition:
+            extras_loss.append(f"Composition(w={getattr(cfg, 'composition_weight', 0.15):.2f})")
         if use_state_head:
             extras_loss.append(f"State(w={cfg.state_weight:.1f})")
         if is_main_process():
@@ -923,6 +946,8 @@ def train_fold(
                 extras_loss.append("Height Head")
             if use_species:
                 extras_loss.append("Species Head")
+            if use_composition:
+                extras_loss.append("Composition Head")
             if use_tweedie:
                 extras_loss.append(f"Tweedie(p={cfg.tweedie_p})")
             if is_main_process():
@@ -1165,6 +1190,7 @@ def train_fold(
             epoch=epoch, use_aux_heads=use_aux_heads,
             use_presence_heads=use_presence, use_ndvi_head=use_ndvi, 
             use_height_head=use_height, use_species_head=use_species,
+            use_composition_head=use_composition,
             use_planthydra=use_planthydra, use_state_head=use_state_head
         )
         val_loss, r2, metrics = validate(
@@ -1357,6 +1383,8 @@ def train_fold(
         "best_l1": best_l1,
         "best_epoch": best_epoch,
         "metrics": best_metrics,
+        "val_size": len(valid_df),
+        "train_size": len(train_df),
     }
 
 
@@ -1440,6 +1468,10 @@ def main() -> None:
                         help="Add auxiliary heads for State/Month/Species classification (all three)")
     parser.add_argument("--use-species-head", action="store_true",
                         help="Add Species classification head only (without State/Month)")
+    parser.add_argument("--use-composition-head", action="store_true",
+                        help="Add Composition Group head (Clover-Dom/Green-Dom/Dead-Heavy/Mixed) - more semantic than species")
+    parser.add_argument("--composition-weight", type=float, default=0.15,
+                        help="Weight for Composition classification loss")
     parser.add_argument("--aux-state-weight", type=float, default=1.0,
                         help="Weight for State classification loss")
     parser.add_argument("--aux-month-weight", type=float, default=1.0,
@@ -1558,6 +1590,10 @@ def main() -> None:
                         help="Disable strong augmentations, use basic transforms only")
     parser.add_argument("--no-lighting", action="store_true", default=False,
                         help="Remove lighting augmentations (ColorJitter, HSV, Brightness, CLAHE)")
+    parser.add_argument("--use-season-aug", action="store_true", default=False,
+                        help="Use season augmentation for cross-season generalization (replaces standard HSV aug)")
+    parser.add_argument("--season-aug-prob", type=float, default=0.5,
+                        help="Probability of applying season augmentation (default: 0.5)")
     parser.add_argument("--photometric", type=str, default="same",
                         choices=["same", "independent", "left", "right", "none"],
                         help="Photometric transform mode: "
@@ -1763,6 +1799,8 @@ def main() -> None:
             extras.append("Height Head")
         if args.use_species_head:
             extras.append("Species Head")
+        if getattr(args, 'use_composition_head', False):
+            extras.append("Composition Head")
         if args.use_tweedie:
             extras.append(f"Tweedie Loss (p={args.tweedie_p})")
         if args.use_learnable_aug:
@@ -1918,11 +1956,23 @@ def main() -> None:
             # Save results after each fold
             avg_r2_scores = [r["best_r2"] for r in results]
             
+            # Calculate weighted R2 average (weighted by validation set size)
+            weighted_r2_scores = [r["metrics"].get("weighted_r2", r["best_r2"]) for r in results]
+            val_sizes = [r.get("val_size", 1) for r in results]
+            
+            # Weighted average: sum(score * weight) / sum(weight)
+            if sum(val_sizes) > 0:
+                cv_weighted_r2_mean = sum(s * w for s, w in zip(weighted_r2_scores, val_sizes)) / sum(val_sizes)
+            else:
+                cv_weighted_r2_mean = np.mean(weighted_r2_scores)
+            
             with open(results_path, "w") as f:
                 json.dump({
                     "status": "training" if len(results) < len(folds_to_train) else "complete",
                     "cv_R2_mean": float(np.mean(avg_r2_scores)),
                     "cv_R2_std": float(np.std(avg_r2_scores)) if len(results) > 1 else 0.0,
+                    "cv_weighted_R2_mean": float(cv_weighted_r2_mean),
+                    "cv_weighted_R2_std": float(np.std(weighted_r2_scores)) if len(results) > 1 else 0.0,
                     "folds": results,
                     "config": vars(args),
                 }, f, indent=2, default=str)
@@ -1934,11 +1984,22 @@ def main() -> None:
         print("=" * 60)
         
         avg_r2_scores = [r["best_r2"] for r in results]
+        weighted_r2_scores = [r["metrics"].get("weighted_r2", r["best_r2"]) for r in results]
+        val_sizes = [r.get("val_size", 1) for r in results]
+        
+        # Weighted average by validation size
+        if sum(val_sizes) > 0:
+            cv_weighted_r2 = sum(s * w for s, w in zip(weighted_r2_scores, val_sizes)) / sum(val_sizes)
+        else:
+            cv_weighted_r2 = np.mean(weighted_r2_scores)
+        
         print(f"Mean CV R²: {np.mean(avg_r2_scores):.4f} ± {np.std(avg_r2_scores):.4f}")
+        print(f"Weighted CV R² (by val size): {cv_weighted_r2:.4f}")
         
         for r in results:
             m = r["metrics"]
-            print(f"  Fold {r['fold']}: R²={r['best_r2']:.4f} "
+            w_r2 = m.get("weighted_r2", r["best_r2"])
+            print(f"  Fold {r['fold']}: R²={r['best_r2']:.4f} wR²={w_r2:.4f} (n={r.get('val_size', '?')}) "
                   f"[G={m['r2_green']:.3f} D={m['r2_dead']:.3f} C={m['r2_clover']:.3f} "
                   f"GDM={m['r2_gdm']:.3f} T={m['r2_total']:.3f}]")
     

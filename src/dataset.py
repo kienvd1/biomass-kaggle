@@ -51,6 +51,25 @@ class BiomassDataset(Dataset):
         "Mixed": 7,
     }
     
+    # Composition-based grouping (based on actual biomass ratios, not species name)
+    # More semantically meaningful than raw species - helps with season generalization
+    # Groups: 0=Clover-Dom (>40% clover), 1=Green-Dom (>70% green),
+    #         2=Dead-Heavy (>40% dead), 3=Mixed (balanced)
+    COMPOSITION_LABELS: Dict[str, int] = {
+        # Clover-Dominant (>40% clover on average)
+        "Clover": 0, "SubcloverDalkeith": 0, "SubcloverLosa": 0,
+        # Green-Dominant (>70% green on average)
+        "Lucerne": 1, "Phalaris": 1, "Phalaris_Ryegrass_Clover": 1,
+        # Dead-Heavy (>40% dead on average)
+        "WhiteClover": 2, "Mixed": 2,
+        "Phalaris_BarleyGrass_SilverGrass_SpearGrass_Clover_Capeweed": 2,
+        # Mixed/Balanced composition
+        "Fescue": 3, "Fescue_CrumbWeed": 3, "Phalaris_Clover": 3,
+        "Ryegrass": 3, "Ryegrass_Clover": 3,
+        "Phalaris_Clover_Ryegrass_Barleygrass_Bromegrass": 3,
+    }
+    NUM_COMPOSITION_GROUPS: int = 4
+    
     def __init__(
         self,
         df: pd.DataFrame,
@@ -132,6 +151,12 @@ class BiomassDataset(Dataset):
                 self.species_labels = self.df["Species"].map(self.SPECIES_LABELS).fillna(7).values.astype(np.int64)
             else:
                 self.species_labels = np.zeros(len(self.df), dtype=np.int64)
+            
+            # Composition group labels (based on actual biomass ratios)
+            if "Species" in self.df.columns:
+                self.composition_labels = self.df["Species"].map(self.COMPOSITION_LABELS).fillna(3).values.astype(np.int64)
+            else:
+                self.composition_labels = np.full(len(self.df), 3, dtype=np.int64)  # Default to Mixed
             
             # Ground-truth NDVI (Pre_GSHH_NDVI) - range typically 0.16-0.91
             if "Pre_GSHH_NDVI" in self.df.columns:
@@ -405,12 +430,77 @@ class BiomassDataset(Dataset):
             state_label = torch.tensor(self.state_labels[idx], dtype=torch.long)
             month_label = torch.tensor(self.month_labels[idx], dtype=torch.long)
             species_label = torch.tensor(self.species_labels[idx], dtype=torch.long)
+            composition_label = torch.tensor(self.composition_labels[idx], dtype=torch.long)
             # Ground-truth NDVI and Height for auxiliary regression
             ndvi_target = torch.tensor(self.ndvi_values[idx], dtype=torch.float32)
             height_target = torch.tensor(self.height_values[idx], dtype=torch.float32)
-            return left_t, right_t, targets, state_label, month_label, species_label, ndvi_target, height_target
+            return left_t, right_t, targets, state_label, month_label, species_label, composition_label, ndvi_target, height_target
 
         return left_t, right_t, targets
+
+
+def get_season_augmentation(p: float = 0.5) -> A.OneOf:
+    """
+    Season augmentation to help model generalize across seasons.
+    
+    Simulates seasonal appearance changes (color, brightness, saturation)
+    to make the model invariant to seasonal variations. Best used with
+    group_season_species CV strategy.
+    
+    Args:
+        p: Probability of applying season augmentation
+        
+    Returns:
+        Albumentations OneOf transform with seasonal variations
+    """
+    return A.OneOf([
+        # DRY/SUMMER: yellower, brighter, less saturated (dried vegetation)
+        A.Compose([
+            A.HueSaturationValue(
+                hue_shift_limit=(-15, 15),
+                sat_shift_limit=(-40, -10),  # drier = less green
+                val_shift_limit=(10, 30),    # brighter sun
+                p=1.0
+            ),
+            A.RandomBrightnessContrast(
+                brightness_limit=(0.1, 0.25),
+                contrast_limit=(0.1, 0.2),
+                p=0.8
+            ),
+        ]),
+        # WET/WINTER: greener, darker, more saturated (lush vegetation)
+        A.Compose([
+            A.HueSaturationValue(
+                hue_shift_limit=(-10, 10),
+                sat_shift_limit=(10, 40),    # lush = more green
+                val_shift_limit=(-30, 0),    # less light
+                p=1.0
+            ),
+            A.RandomBrightnessContrast(
+                brightness_limit=(-0.2, 0),
+                contrast_limit=(-0.1, 0.1),
+                p=0.8
+            ),
+        ]),
+        # SPRING: moderate green, variable conditions
+        A.Compose([
+            A.HueSaturationValue(
+                hue_shift_limit=(-5, 15),
+                sat_shift_limit=(0, 25),
+                val_shift_limit=(-10, 15),
+                p=1.0
+            ),
+        ]),
+        # AUTUMN: transition colors, moderate
+        A.Compose([
+            A.HueSaturationValue(
+                hue_shift_limit=(5, 20),     # slight yellow shift
+                sat_shift_limit=(-20, 10),
+                val_shift_limit=(-5, 10),
+                p=1.0
+            ),
+        ]),
+    ], p=p)
 
 
 def get_train_transforms(
@@ -420,6 +510,8 @@ def get_train_transforms(
     no_lighting: bool = False,
     use_perspective_jitter: bool = False,
     use_border_mask: bool = False,
+    use_season_aug: bool = False,
+    season_aug_prob: float = 0.5,
 ) -> A.ReplayCompose:
     """Get training augmentations with replay support for consistent stereo augmentation.
     
@@ -429,6 +521,8 @@ def get_train_transforms(
         strong: If True, use stronger augmentations from dinov3-5tar.ipynb notebook
         use_perspective_jitter: If True, add perspective warp to simulate annotation noise
         use_border_mask: If True, add border masking to prevent frame-based shortcuts
+        use_season_aug: If True, add season augmentation for cross-season generalization
+        season_aug_prob: Probability of applying season augmentation (default 0.5)
     
     NOTE: This applies the SAME photometric transforms to both views (via replay),
     which may allow the model to "cheat" by matching pixel noise. For stereo-correct
@@ -475,12 +569,21 @@ def get_train_transforms(
         
         # Lighting augmentations (skip if no_lighting=True)
         if not no_lighting:
-            transforms.extend([
-                A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.75),
-                A.HueSaturationValue(hue_shift_limit=20, sat_shift_limit=30, val_shift_limit=20, p=0.5),
-                A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.3),
-                A.CLAHE(p=0.2),
-            ])
+            if use_season_aug:
+                # Season augmentation REPLACES standard HSV augmentations to avoid compounding
+                # Season aug already does HSV shifts + brightness/contrast
+                transforms.extend([
+                    A.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.1, hue=0.05, p=0.5),  # Reduced
+                    get_season_augmentation(p=season_aug_prob),  # Main color variation
+                    A.CLAHE(p=0.2),
+                ])
+            else:
+                transforms.extend([
+                    A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.75),
+                    A.HueSaturationValue(hue_shift_limit=20, sat_shift_limit=30, val_shift_limit=20, p=0.5),
+                    A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.3),
+                    A.CLAHE(p=0.2),
+                ])
         
         transforms.extend([
             A.Affine(
@@ -517,18 +620,24 @@ def get_train_transforms(
                 A.GaussNoise(std_range=(0.02, 0.1), p=1.0),
                 A.GaussianBlur(blur_limit=(3, 5), p=1.0),
             ], p=0.3),
-            A.OneOf([
+        ])
+        
+        # Color augmentation: use season aug OR standard HSV (not both)
+        if use_season_aug:
+            transforms.append(get_season_augmentation(p=season_aug_prob))
+        else:
+            transforms.append(A.OneOf([
                 A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=1.0),
                 A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=20, val_shift_limit=20, p=1.0),
-            ], p=aug_prob),
-            A.CoarseDropout(
-                num_holes_range=(1, 8),
-                hole_height_range=(8, 32),
-                hole_width_range=(8, 32),
-                fill=0,
-                p=0.3,
-            ),
-        ])
+            ], p=aug_prob))
+        
+        transforms.append(A.CoarseDropout(
+            num_holes_range=(1, 8),
+            hole_height_range=(8, 32),
+            hole_width_range=(8, 32),
+            fill=0,
+            p=0.3,
+        ))
     
     # Common normalization and tensor conversion
     transforms.extend([
@@ -753,6 +862,18 @@ def create_folds(
             - "group_location": RECOMMENDED - GroupKFold by sample_id_prefix (location+date), 
                                stratified by State×Season×Species. Best for preventing data leakage
                                and ensuring balanced green/dead/clover distribution across folds.
+            - "temporal_within_species": Temporal split within each species group.
+                               Ensures all species in train AND val, tests on later dates per species.
+                               Fold 0 = latest dates (most LB-representative), Fold 4 = earliest.
+            - "temporal_stratified": Temporal within Species × has_clover × total_bin.
+                               Best balance of species, clover presence, and target magnitude across folds.
+                               Fold 0 = latest dates (most LB-representative).
+            - "group_season_species": BEST FOR LB - GroupKFold by Season×Species combination.
+                               Zero season×species leakage, all species groups covered in every fold.
+                               Best when test set has same species but different seasons.
+            - "group_season_composition": GroupKFold by Season×Composition (Clover-Dom/Green-Dom/Dead-Heavy/Mixed).
+                               Zero season×composition leakage. Use with --use-composition-head.
+                               Tests if model learns composition-based features.
             - "group_month": StratifiedGroupKFold grouped by month, stratified by Dry_Total_g bins
             - "group_date": StratifiedGroupKFold grouped by Sampling_Date, stratified by Dry_Total_g bins
             - "group_date_state": StratifiedGroupKFold grouped by Sampling_Date_Month, stratified by State
@@ -935,6 +1056,235 @@ def create_folds(
             
             # Cleanup temp columns
             df = df.drop(columns=["_Season", "_SpeciesGroup"], errors="ignore")
+    
+    elif cv_strategy == "temporal_within_species":
+        # BEST FOR LB: Temporal split within each species group
+        # - All species groups appear in every train AND val fold
+        # - Val samples are from later dates within each species
+        # - Fold 0 = latest dates (most LB-representative when test is future time)
+        # - Fold 4 = earliest dates
+        # Best when: test set has same species but different time period (e.g., 2016-2017 vs 2015)
+        
+        species_to_group = {
+            "Clover": "Clover", "WhiteClover": "Clover",
+            "SubcloverLosa": "Clover", "SubcloverDalkeith": "Clover",
+            "Ryegrass": "Ryegrass", "Ryegrass_Clover": "Ryegrass",
+            "Phalaris": "Phalaris", "Phalaris_Clover": "Phalaris",
+            "Phalaris_Ryegrass_Clover": "Phalaris",
+            # Everything else -> Other (Fescue, Lucerne, Mixed, etc.)
+        }
+        df["_species_group"] = df["Species"].map(lambda x: species_to_group.get(x, "Other"))
+        df["_date_parsed"] = pd.to_datetime(df["Sampling_Date"], format="mixed", dayfirst=True)
+        
+        print(f"\nUsing temporal_within_species (temporal split within each species group)")
+        print(f"Species groups: {df['_species_group'].value_counts().to_dict()}")
+        
+        # Assign folds: within each species, sort by date and assign to folds
+        # Reverse order so fold 0 = latest dates (most LB-representative)
+        for species_grp in df["_species_group"].unique():
+            mask = df["_species_group"] == species_grp
+            grp_df = df.loc[mask].sort_values("_date_parsed").reset_index()
+            n = len(grp_df)
+            
+            for i, row in grp_df.iterrows():
+                # Reverse: latest samples get fold 0, earliest get fold n_folds-1
+                fold_idx = n_folds - 1 - min(int(i / n * n_folds), n_folds - 1)
+                df.loc[row["index"], "fold"] = fold_idx
+        
+        # Print fold info
+        for fold_idx in range(n_folds):
+            train_mask = df["fold"] != fold_idx
+            val_mask = df["fold"] == fold_idx
+            val_species = df.loc[val_mask, "_species_group"].value_counts().to_dict()
+            val_dates = df.loc[val_mask, "_date_parsed"]
+            print(f"Fold {fold_idx}: train={train_mask.sum()} val={val_mask.sum()} | "
+                  f"val_dates: {val_dates.min().date()}-{val_dates.max().date()} | "
+                  f"species: {val_species}")
+        
+        print("\nNote: Fold 0 tests on LATEST dates per species (most LB-representative)")
+        
+        # Cleanup
+        df = df.drop(columns=["_species_group", "_date_parsed"], errors="ignore")
+    
+    elif cv_strategy == "temporal_stratified":
+        # BEST FOR LB + BALANCE: Temporal split within Species × has_clover × total_bin strata
+        # - All species groups, clover presence, and target magnitude balanced across folds
+        # - Val samples are from later dates within each stratum
+        # - Fold 0 = latest dates (most LB-representative)
+        # Best when: test set has same species/composition but different time period
+        
+        species_to_group = {
+            "Clover": "Clover", "WhiteClover": "Clover",
+            "SubcloverLosa": "Clover", "SubcloverDalkeith": "Clover",
+            "Ryegrass": "Ryegrass", "Ryegrass_Clover": "Ryegrass",
+            "Phalaris": "Phalaris", "Phalaris_Clover": "Phalaris",
+            "Phalaris_Ryegrass_Clover": "Phalaris",
+        }
+        df["_species_group"] = df["Species"].map(lambda x: species_to_group.get(x, "Other"))
+        df["_date_parsed"] = pd.to_datetime(df["Sampling_Date"], format="mixed", dayfirst=True)
+        
+        # Stratification: species × has_clover × total_bin
+        df["_has_clover"] = (df["Dry_Clover_g"] > 0).astype(int)
+        df["_total_bin"] = pd.qcut(df["Dry_Total_g"], q=2, labels=False, duplicates="drop")
+        df["_strata"] = (df["_species_group"] + "_clover" + df["_has_clover"].astype(str) 
+                        + "_total" + df["_total_bin"].astype(str))
+        
+        print(f"\nUsing temporal_stratified (temporal within Species × has_clover × total_bin)")
+        print(f"Species groups: {df['_species_group'].value_counts().to_dict()}")
+        print(f"Has clover: {df['_has_clover'].value_counts().to_dict()}")
+        print(f"Total bins: {df['_total_bin'].value_counts().to_dict()}")
+        print(f"Unique strata: {df['_strata'].nunique()}")
+        
+        # Within each stratum, sort by date and assign to folds
+        for stratum in df["_strata"].unique():
+            mask = df["_strata"] == stratum
+            grp_df = df.loc[mask].sort_values("_date_parsed").reset_index()
+            n = len(grp_df)
+            
+            for i, row in grp_df.iterrows():
+                # Reverse: latest samples get fold 0
+                fold_idx = n_folds - 1 - min(int(i / n * n_folds), n_folds - 1)
+                df.loc[row["index"], "fold"] = fold_idx
+        
+        # Print fold info
+        for fold_idx in range(n_folds):
+            train_mask = df["fold"] != fold_idx
+            val_mask = df["fold"] == fold_idx
+            val_species = df.loc[val_mask, "_species_group"].value_counts().to_dict()
+            val_clover = df.loc[val_mask, "_has_clover"].value_counts().to_dict()
+            val_total = df.loc[val_mask, "_total_bin"].value_counts().to_dict()
+            print(f"Fold {fold_idx}: train={train_mask.sum()} val={val_mask.sum()} | "
+                  f"species={val_species} | clover={val_clover} | total={val_total}")
+        
+        print("\nNote: Fold 0 tests on LATEST dates per stratum (most LB-representative)")
+        
+        # Cleanup
+        df = df.drop(columns=["_species_group", "_date_parsed", "_has_clover", "_total_bin", "_strata"], 
+                    errors="ignore")
+    
+    elif cv_strategy == "group_season_species":
+        # BEST FOR LB: GroupKFold by Season×Species combination
+        # - Zero season×species leakage (avoids 50-65% target variance explained by group)
+        # - All 4 species groups covered in every fold
+        # - Tests generalization to unseen season×species combinations
+        # Best combined with season augmentation for better generalization
+        
+        # Create season from month (Southern Hemisphere)
+        month_to_season = {
+            12: "Summer", 1: "Summer", 2: "Summer",
+            3: "Autumn", 4: "Autumn", 5: "Autumn",
+            6: "Winter", 7: "Winter", 8: "Winter",
+            9: "Spring", 10: "Spring", 11: "Spring"
+        }
+        df["_month"] = df["Sampling_Date_Month"].astype(int)
+        df["_season"] = df["_month"].map(month_to_season)
+        df["_season_species"] = df["_season"] + "_" + df["Species"]
+        
+        # Species groups for stratification
+        species_to_group = {
+            "Clover": "Clover", "WhiteClover": "Clover",
+            "SubcloverLosa": "Clover", "SubcloverDalkeith": "Clover",
+            "Ryegrass": "Ryegrass", "Ryegrass_Clover": "Ryegrass",
+            "Phalaris": "Phalaris", "Phalaris_Clover": "Phalaris",
+            "Phalaris_Ryegrass_Clover": "Phalaris",
+        }
+        df["_species_group"] = df["Species"].map(lambda x: species_to_group.get(x, "Other"))
+        
+        print(f"\nUsing group_season_species (GroupKFold by Season×Species)")
+        print(f"Seasons: {df['_season'].value_counts().to_dict()}")
+        print(f"Species groups: {df['_species_group'].value_counts().to_dict()}")
+        print(f"Unique season×species combos: {df['_season_species'].nunique()}")
+        
+        sgkf = StratifiedGroupKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+        for fold_idx, (train_idx, val_idx) in enumerate(
+            sgkf.split(df, df["_species_group"], groups=df["_season_species"])
+        ):
+            df.loc[df.index[val_idx], "fold"] = fold_idx
+        
+        # Print fold info
+        for fold_idx in range(n_folds):
+            train_mask = df["fold"] != fold_idx
+            val_mask = df["fold"] == fold_idx
+            
+            val_species = df.loc[val_mask, "_species_group"].value_counts().to_dict()
+            val_seasons = sorted(df.loc[val_mask, "_season"].unique())
+            
+            # Check season×species overlap
+            train_ss = set(df.loc[train_mask, "_season_species"])
+            val_ss = set(df.loc[val_mask, "_season_species"])
+            ss_overlap = len(train_ss & val_ss)
+            
+            print(f"Fold {fold_idx}: train={train_mask.sum()} val={val_mask.sum()} | "
+                  f"seasons={val_seasons} | species={val_species} | S×S overlap={ss_overlap}")
+        
+        print("\nNote: Use with season augmentation for best generalization to unseen season×species")
+        
+        # Cleanup
+        df = df.drop(columns=["_month", "_season", "_season_species", "_species_group"], errors="ignore")
+    
+    elif cv_strategy == "group_season_composition":
+        # GroupKFold by Season×Composition combination
+        # - Zero season×composition leakage
+        # - Tests if model learns composition-based features (not species names)
+        # - Best combined with composition auxiliary head and season augmentation
+        
+        # Create season from month (Southern Hemisphere)
+        month_to_season = {
+            12: "Summer", 1: "Summer", 2: "Summer",
+            3: "Autumn", 4: "Autumn", 5: "Autumn",
+            6: "Winter", 7: "Winter", 8: "Winter",
+            9: "Spring", 10: "Spring", 11: "Spring"
+        }
+        df["_month"] = df["Sampling_Date_Month"].astype(int)
+        df["_season"] = df["_month"].map(month_to_season)
+        
+        # Map species to composition groups
+        composition_map = {
+            "Clover": "Clover-Dom", "SubcloverDalkeith": "Clover-Dom", "SubcloverLosa": "Clover-Dom",
+            "Lucerne": "Green-Dom", "Phalaris": "Green-Dom", "Phalaris_Ryegrass_Clover": "Green-Dom",
+            "WhiteClover": "Dead-Heavy", "Mixed": "Dead-Heavy",
+            "Phalaris_BarleyGrass_SilverGrass_SpearGrass_Clover_Capeweed": "Dead-Heavy",
+            "Fescue": "Mixed-Bal", "Fescue_CrumbWeed": "Mixed-Bal", "Phalaris_Clover": "Mixed-Bal",
+            "Ryegrass": "Mixed-Bal", "Ryegrass_Clover": "Mixed-Bal",
+            "Phalaris_Clover_Ryegrass_Barleygrass_Bromegrass": "Mixed-Bal",
+        }
+        df["_composition"] = df["Species"].map(composition_map).fillna("Mixed-Bal")
+        df["_season_composition"] = df["_season"] + "_" + df["_composition"]
+        
+        print(f"\nUsing group_season_composition (GroupKFold by Season×Composition)")
+        print(f"Seasons: {df['_season'].value_counts().to_dict()}")
+        print(f"Compositions: {df['_composition'].value_counts().to_dict()}")
+        print(f"Unique season×composition combos: {df['_season_composition'].nunique()}")
+        
+        from sklearn.model_selection import GroupKFold
+        gkf = GroupKFold(n_splits=n_folds)
+        for fold_idx, (train_idx, val_idx) in enumerate(
+            gkf.split(df, groups=df["_season_composition"])
+        ):
+            df.loc[df.index[val_idx], "fold"] = fold_idx
+        
+        # Print fold info
+        for fold_idx in range(n_folds):
+            train_mask = df["fold"] != fold_idx
+            val_mask = df["fold"] == fold_idx
+            
+            val_comps = df.loc[val_mask, "_composition"].value_counts().to_dict()
+            val_seasons = sorted(df.loc[val_mask, "_season"].unique())
+            val_combos = sorted(df.loc[val_mask, "_season_composition"].unique())
+            
+            # Check overlap
+            train_sc = set(df.loc[train_mask, "_season_composition"])
+            val_sc = set(df.loc[val_mask, "_season_composition"])
+            sc_overlap = len(train_sc & val_sc)
+            
+            print(f"Fold {fold_idx}: train={train_mask.sum()} val={val_mask.sum()} | "
+                  f"val combos={val_combos} | overlap={sc_overlap}")
+        
+        print("\n✅ Zero season×composition leakage!")
+        print("Note: Use with --use-composition-head and --use-season-aug for best results")
+        
+        # Cleanup
+        df = df.drop(columns=["_month", "_season", "_composition", "_season_composition"], errors="ignore")
     
     elif cv_strategy == "random":
         # Standard random KFold (no stratification)

@@ -1063,6 +1063,7 @@ class DINOv3Direct(nn.Module):
     NUM_STATES = 4
     NUM_MONTHS = 10
     NUM_SPECIES = 8
+    NUM_COMPOSITION_GROUPS = 4  # Clover-Dom, Green-Dom, Dead-Heavy, Mixed
     
     def __init__(
         self,
@@ -1092,6 +1093,7 @@ class DINOv3Direct(nn.Module):
         use_ndvi_head: bool = False,
         use_height_head: bool = False,
         use_species_head: bool = False,
+        use_composition_head: bool = False,
     ) -> None:
         super().__init__()
         
@@ -1110,6 +1112,7 @@ class DINOv3Direct(nn.Module):
         self.use_ndvi_head = use_ndvi_head
         self.use_height_head = use_height_head
         self.use_species_head = use_species_head
+        self.use_composition_head = use_composition_head
         
         self.grid = tuple(grid)
         self.use_film = use_film
@@ -1301,6 +1304,16 @@ class DINOv3Direct(nn.Module):
                 nn.Linear(hidden_dim // 2, self.NUM_SPECIES),
             )
         
+        # Composition group head: Classifies into composition-based groups
+        # (Clover-Dom, Green-Dom, Dead-Heavy, Mixed) - more semantic than species
+        if use_composition_head:
+            self.head_composition = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim // 2),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim // 2, self.NUM_COMPOSITION_GROUPS),
+            )
+        
         self.softplus = nn.Softplus(beta=1.0)
         
         self._init_weights()
@@ -1322,6 +1335,8 @@ class DINOv3Direct(nn.Module):
             heads.append(self.head_height)
         if self.use_species_head and not self.use_aux_heads:
             heads.append(self.head_species_only)
+        if self.use_composition_head:
+            heads.append(self.head_composition)
         
         for head in heads:
             for m in head.modules():
@@ -1569,6 +1584,11 @@ class DINOv3Direct(nn.Module):
         if self.use_species_head and not self.use_aux_heads:
             species_logits = self.head_species_only(f)  # (B, NUM_SPECIES)
         
+        # Composition group prediction (Clover-Dom, Green-Dom, Dead-Heavy, Mixed)
+        composition_logits = None
+        if self.use_composition_head:
+            composition_logits = self.head_composition(f)  # (B, NUM_COMPOSITION_GROUPS)
+        
         # Return auxiliary logits if requested
         if return_aux and self.use_aux_heads:
             state_logits = self.head_state(f)
@@ -1576,9 +1596,9 @@ class DINOv3Direct(nn.Module):
             species_logits = self.head_species(f)
             return green, dead, clover, gdm, total, aux_loss, state_logits, month_logits, species_logits
         
-        # Return with presence/NDVI/Height/Species if enabled
-        if self.use_presence_heads or self.use_ndvi_head or self.use_height_head or self.use_species_head:
-            return green, dead, clover, gdm, total, aux_loss, dead_presence_logit, clover_presence_logit, ndvi_pred, height_pred, species_logits
+        # Return with presence/NDVI/Height/Species/Composition if enabled
+        if self.use_presence_heads or self.use_ndvi_head or self.use_height_head or self.use_species_head or self.use_composition_head:
+            return green, dead, clover, gdm, total, aux_loss, dead_presence_logit, clover_presence_logit, ndvi_pred, height_pred, species_logits, composition_logits
         
         return green, dead, clover, gdm, total, aux_loss
 
@@ -1770,6 +1790,8 @@ class PlantHydraLoss(nn.Module):
         species_weight: float = 0.1,
         use_state_aux: bool = False,
         state_weight: float = 0.1,
+        use_composition_aux: bool = False,
+        composition_weight: float = 0.15,  # Slightly higher than species - more semantic
         train_dead: bool = False,
         train_clover: bool = False,
     ) -> None:
@@ -1790,6 +1812,8 @@ class PlantHydraLoss(nn.Module):
         self.species_weight = species_weight
         self.use_state_aux = use_state_aux
         self.state_weight = state_weight
+        self.use_composition_aux = use_composition_aux
+        self.composition_aux_weight = composition_weight
         self.train_dead = train_dead
         self.train_clover = train_clover
         
@@ -1809,6 +1833,8 @@ class PlantHydraLoss(nn.Module):
         species_labels: torch.Tensor = None,
         state_logits: torch.Tensor = None,
         state_labels: torch.Tensor = None,
+        composition_logits: torch.Tensor = None,
+        composition_labels: torch.Tensor = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Args:
@@ -1822,6 +1848,8 @@ class PlantHydraLoss(nn.Module):
             species_labels: (B,) species labels
             state_logits: (B, num_states) state classification logits
             state_labels: (B,) state labels
+            composition_logits: (B, num_composition_groups) composition group logits
+            composition_labels: (B,) composition group labels (0-3)
         
         Returns:
             total_loss: Combined loss
@@ -1902,6 +1930,13 @@ class PlantHydraLoss(nn.Module):
             state_loss = F.cross_entropy(state_logits, state_labels, label_smoothing=0.1)
             total_loss = total_loss + self.state_weight * state_loss
             loss_dict["state"] = state_loss.item()
+        
+        # 9. Composition group classification loss
+        # More semantic than species - predicts Clover-Dom/Green-Dom/Dead-Heavy/Mixed
+        if self.use_composition_aux and composition_logits is not None and composition_labels is not None:
+            composition_loss = F.cross_entropy(composition_logits, composition_labels, label_smoothing=0.1)
+            total_loss = total_loss + self.composition_aux_weight * composition_loss
+            loss_dict["composition"] = composition_loss.item()
         
         loss_dict["total"] = total_loss.item()
         
